@@ -126,7 +126,7 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
   case HintCategory::ColdPathOutlining:
     return fixColdPath(Hint, Ctx);
   case HintCategory::ContainerReserve:
-    return fixContainerReserve(Hint, Ctx);
+    return {}; // Disabled: scope analysis too fragile for safe auto-fix
   case HintCategory::StringByValue:
     return fixStringByValue(Hint, Ctx);
   case HintCategory::RangeForConversion:
