@@ -197,6 +197,394 @@ fixCopyInRangeForStatic(const PerfHint &H, ASTContext &Ctx,
   return {Fix1, Fix2};
 }
 
+/// Read up to \p MaxLen characters of source text ending at \p Loc
+/// (i.e. scanning backward).
+static StringRef getSourceSnippetBefore(SourceLocation Loc, unsigned MaxLen,
+                                        const SourceManager &SM,
+                                        const LangOptions &LO) {
+  if (!Loc.isValid())
+    return {};
+  unsigned Offset = SM.getFileOffset(Loc);
+  unsigned ScanBack = std::min(Offset, MaxLen);
+  if (ScanBack == 0)
+    return {};
+  SourceLocation Start = Loc.getLocWithOffset(-(int)ScanBack);
+  bool Invalid = false;
+  const char *Data = SM.getCharacterData(Start, &Invalid);
+  if (Invalid || !Data)
+    return {};
+  return StringRef(Data, ScanBack);
+}
+
+/// Fix StringConcatInLoop: insert .reserve() before the loop.
+/// SrcLoc points to the += operator inside the loop body.
+static std::vector<AutoFix>
+fixStringConcatInLoopStatic(const PerfHint &H, ASTContext &Ctx,
+                            SourceManager &SM) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  // Read backward from the += operator to find the string variable name
+  // and the enclosing loop.
+  StringRef Before = getSourceSnippetBefore(Loc, 512, SM, LO);
+  if (Before.empty())
+    return {};
+
+  // The text right before Loc should be "VARNAME " (then we're at +=).
+  // Scan backward past whitespace, then read the identifier.
+  size_t Pos = Before.size();
+  while (Pos > 0 && Before[Pos - 1] == ' ')
+    --Pos;
+  size_t NameEnd = Pos;
+  while (Pos > 0 && (isalnum(Before[Pos - 1]) || Before[Pos - 1] == '_'))
+    --Pos;
+  StringRef VarName = Before.substr(Pos, NameEnd - Pos);
+  if (VarName.empty())
+    return {};
+
+  // Validate variable name.
+  for (char C : VarName) {
+    if (!isalnum(C) && C != '_')
+      return {};
+  }
+
+  // Find the last "for" or "while" keyword before Loc.
+  size_t ForPos = Before.rfind("for");
+  size_t WhilePos = Before.rfind("while");
+  size_t LoopPos = StringRef::npos;
+  if (ForPos != StringRef::npos && WhilePos != StringRef::npos)
+    LoopPos = std::max(ForPos, WhilePos);
+  else if (ForPos != StringRef::npos)
+    LoopPos = ForPos;
+  else if (WhilePos != StringRef::npos)
+    LoopPos = WhilePos;
+  if (LoopPos == StringRef::npos)
+    return {};
+
+  SourceLocation LoopLoc = Loc.getLocWithOffset(-(int)(Before.size() - LoopPos));
+
+  // Read forward from the loop to analyze the header.
+  StringRef LoopSnippet = getSourceSnippet(LoopLoc, 256, SM, LO);
+  if (LoopSnippet.empty())
+    return {};
+
+  // Find '(' and matching ')'.
+  size_t ParenOpen = LoopSnippet.find('(');
+  if (ParenOpen == StringRef::npos)
+    return {};
+
+  unsigned Depth = 0;
+  size_t ParenClose = StringRef::npos;
+  for (size_t I = ParenOpen; I < LoopSnippet.size(); ++I) {
+    if (LoopSnippet[I] == '(') ++Depth;
+    else if (LoopSnippet[I] == ')') {
+      --Depth;
+      if (Depth == 0) { ParenClose = I; break; }
+    }
+  }
+  if (ParenClose == StringRef::npos)
+    return {};
+
+  // Determine the reserve size.
+  std::string ReserveArg;
+  StringRef ForHeader = LoopSnippet.substr(ParenOpen + 1, ParenClose - ParenOpen - 1);
+  size_t ColonPos = ForHeader.find(':');
+  if (ColonPos != StringRef::npos) {
+    // Range-for: extract container name after ':'
+    StringRef Container = ForHeader.substr(ColonPos + 1).trim();
+    if (Container.empty())
+      return {};
+    // Validate container is a simple identifier.
+    bool Valid = true;
+    for (char C : Container) {
+      if (!isalnum(C) && C != '_') { Valid = false; break; }
+    }
+    if (!Valid)
+      return {};
+    ReserveArg = (Container + ".size() * 16").str();
+  } else {
+    ReserveArg = "1024";
+  }
+
+  // Get indentation.
+  unsigned Col = SM.getSpellingColumnNumber(LoopLoc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = LoopLoc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + VarName.str() + ".reserve(" + ReserveArg + ");\n";
+  Fix.Description = "insert .reserve() before loop to reduce string reallocations";
+  return {Fix};
+}
+
+/// Fix RegexInLoop: add `static const` to the regex variable inside the loop.
+/// SrcLoc points to the CXXConstructExpr begin, e.g. at the variable name
+/// in "std::regex pat(R"(\d+)")".
+/// Making the regex `static const` means it's only compiled once (on first call)
+/// even though it remains inside the loop syntactically.
+static std::vector<AutoFix>
+fixRegexInLoopStatic(const PerfHint &H, ASTContext &Ctx,
+                     SourceManager &SM) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  // Read backward from Loc to find "std::regex " preceding the var name.
+  StringRef Before = getSourceSnippetBefore(Loc, 256, SM, LO);
+  if (Before.empty())
+    return {};
+
+  // Find the "std::regex " or "regex " that precedes the variable name.
+  size_t RegexTypePos = Before.rfind("std::regex ");
+  if (RegexTypePos == StringRef::npos) {
+    RegexTypePos = Before.rfind("regex ");
+    if (RegexTypePos == StringRef::npos)
+      return {};
+  }
+
+  // Already has "static" before the type?
+  StringRef BeforeType = Before.substr(0, RegexTypePos).rtrim();
+  if (BeforeType.ends_with("static"))
+    return {};
+
+  // Compute the source location of the type keyword.
+  SourceLocation TypeLoc = Loc.getLocWithOffset(-(int)(Before.size() - RegexTypePos));
+
+  // Verify it has a string literal pattern (read forward).
+  StringRef FromType = getSourceSnippet(TypeLoc, 256, SM, LO);
+  if (FromType.empty() || !FromType.contains("\""))
+    return {};
+
+  // Insert "static const " before "std::regex" / "regex".
+  AutoFix Fix;
+  Fix.Loc = TypeLoc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = "static const ";
+  Fix.Description = "make regex static const to avoid recompilation each iteration";
+  return {Fix};
+}
+
+/// Fix ThrowInNoexcept: remove noexcept from the enclosing function.
+static std::vector<AutoFix>
+fixThrowInNoexceptStatic(const PerfHint &H, ASTContext &Ctx,
+                         SourceManager &SM) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  // SrcLoc points to the throw expression or the function.
+  // Scan backward to find "noexcept" in the function signature.
+  StringRef Before = getSourceSnippetBefore(Loc, 1024, SM, LO);
+  if (Before.empty())
+    return {};
+
+  // Find the last "noexcept" before Loc.
+  size_t NoexceptPos = Before.rfind("noexcept");
+  if (NoexceptPos == StringRef::npos)
+    return {};
+
+  // Make sure this isn't "noexcept(false)" or "noexcept(expr)" — only
+  // remove plain "noexcept" or "noexcept(true)".
+  StringRef AfterNE = Before.substr(NoexceptPos + 8).ltrim();
+  std::string OldText = "noexcept";
+  if (AfterNE.starts_with("(")) {
+    // Check for noexcept(true) or noexcept(false).
+    size_t CloseP = AfterNE.find(')');
+    if (CloseP == StringRef::npos)
+      return {};
+    StringRef Inside = AfterNE.substr(1, CloseP - 1).trim();
+    if (Inside == "true") {
+      // noexcept(true) — safe to remove.
+      // Calculate the full extent including parens.
+      size_t FullEnd = NoexceptPos + 8 + (AfterNE.data() - Before.substr(NoexceptPos + 8).data()) + CloseP + 1;
+      OldText = Before.substr(NoexceptPos, FullEnd - NoexceptPos).str();
+    } else if (Inside == "false") {
+      // Already noexcept(false) — nothing to do.
+      return {};
+    } else {
+      // Complex expression — don't touch.
+      return {};
+    }
+  }
+
+  // Also consume a space before "noexcept" if present.
+  std::string RemoveText = OldText;
+  size_t SpaceBefore = NoexceptPos;
+  while (SpaceBefore > 0 && Before[SpaceBefore - 1] == ' ')
+    --SpaceBefore;
+  if (SpaceBefore < NoexceptPos) {
+    // Include one space before.
+    RemoveText = " " + OldText;
+    NoexceptPos = NoexceptPos - 1;
+  }
+
+  SourceLocation NeLoc = Loc.getLocWithOffset(-(int)(Before.size() - NoexceptPos));
+
+  AutoFix Fix;
+  Fix.Loc = NeLoc;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = RemoveText;
+  Fix.NewText = "";
+  Fix.Description = "remove noexcept from function that contains throw";
+  return {Fix};
+}
+
+/// Fix DuplicateCondition: remove duplicated sub-expression in &&.
+static std::vector<AutoFix>
+fixDuplicateConditionStatic(const PerfHint &H, ASTContext &Ctx,
+                            SourceManager &SM) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Find the condition inside if(...).
+  size_t IfPos = Snippet.find("if");
+  if (IfPos == StringRef::npos)
+    return {};
+
+  size_t ParenOpen = Snippet.find('(', IfPos);
+  if (ParenOpen == StringRef::npos)
+    return {};
+
+  // Find matching ')'.
+  unsigned Depth = 0;
+  size_t ParenClose = StringRef::npos;
+  for (size_t I = ParenOpen; I < Snippet.size(); ++I) {
+    if (Snippet[I] == '(') ++Depth;
+    else if (Snippet[I] == ')') {
+      --Depth;
+      if (Depth == 0) { ParenClose = I; break; }
+    }
+  }
+  if (ParenClose == StringRef::npos)
+    return {};
+
+  StringRef Condition = Snippet.substr(ParenOpen + 1, ParenClose - ParenOpen - 1).trim();
+  if (Condition.empty())
+    return {};
+
+  // Look for " && " in the condition.
+  size_t AndPos = Condition.find(" && ");
+  if (AndPos == StringRef::npos)
+    return {};
+
+  StringRef LHS = Condition.substr(0, AndPos).trim();
+  StringRef RHS = Condition.substr(AndPos + 4).trim();
+
+  // Only fix if LHS == RHS (exact duplicate).
+  if (LHS != RHS)
+    return {};
+
+  if (LHS.empty())
+    return {};
+
+  // Replace "LHS && RHS" with just "LHS".
+  std::string OldCond = Condition.str();
+  std::string NewCond = LHS.str();
+
+  SourceLocation CondLoc = Loc.getLocWithOffset(ParenOpen + 1 +
+    (Condition.data() - Snippet.substr(ParenOpen + 1).data()));
+
+  AutoFix Fix;
+  Fix.Loc = CondLoc;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = OldCond;
+  Fix.NewText = NewCond;
+  Fix.Description = "remove duplicate condition in logical AND";
+  return {Fix};
+}
+
+/// Fix DivisionChain: rewrite `a / b / c` to `a / (b * c)`.
+static std::vector<AutoFix>
+fixDivisionChainStatic(const PerfHint &H, ASTContext &Ctx,
+                       SourceManager &SM) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Find "EXPR / IDENT / IDENT" pattern. We need two '/' operators.
+  // Find the statement (up to ';').
+  size_t SemiPos = Snippet.find(';');
+  if (SemiPos == StringRef::npos)
+    return {};
+
+  StringRef Stmt = Snippet.substr(0, SemiPos);
+
+  // Find "return " prefix if present.
+  StringRef Expr = Stmt;
+  size_t ReturnPos = Stmt.find("return ");
+  if (ReturnPos != StringRef::npos)
+    Expr = Stmt.substr(ReturnPos + 7).trim();
+
+  // Find the two '/' operators. Must not be '//' (comment) or '/=' or '/*'.
+  size_t Div1 = StringRef::npos;
+  size_t Div2 = StringRef::npos;
+  for (size_t I = 0; I < Expr.size(); ++I) {
+    if (Expr[I] == '/') {
+      // Skip //, /*, /=
+      if (I + 1 < Expr.size() &&
+          (Expr[I + 1] == '/' || Expr[I + 1] == '*' || Expr[I + 1] == '='))
+        continue;
+      // Skip if preceded by '/' (already part of //)
+      if (I > 0 && Expr[I - 1] == '/')
+        continue;
+      if (Div1 == StringRef::npos)
+        Div1 = I;
+      else if (Div2 == StringRef::npos)
+        Div2 = I;
+      else
+        return {}; // More than 2 divisions — too complex.
+    }
+  }
+
+  if (Div1 == StringRef::npos || Div2 == StringRef::npos)
+    return {};
+
+  // Extract: a / b / c
+  StringRef A = Expr.substr(0, Div1).trim();
+  StringRef B = Expr.substr(Div1 + 1, Div2 - Div1 - 1).trim();
+  StringRef C = Expr.substr(Div2 + 1).trim();
+
+  if (A.empty() || B.empty() || C.empty())
+    return {};
+
+  // Validate B and C are simple identifiers.
+  auto isSimpleIdent = [](StringRef S) {
+    for (char Ch : S) {
+      if (!isalnum(Ch) && Ch != '_' && Ch != '.')
+        return false;
+    }
+    return !S.empty();
+  };
+
+  if (!isSimpleIdent(B) || !isSimpleIdent(C))
+    return {};
+
+  // Build: "a / (b * c)"
+  std::string NewExpr = (A + " / (" + B + " * " + C + ")").str();
+  std::string OldExpr = Expr.str();
+
+  // Find the expression in the original snippet to replace it.
+  SourceLocation ExprLoc = Loc;
+  if (ReturnPos != StringRef::npos)
+    ExprLoc = Loc.getLocWithOffset(ReturnPos + 7 +
+      (Expr.data() - Stmt.substr(ReturnPos + 7).ltrim().data()));
+
+  // Simpler approach: replace the whole expression in the snippet.
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = OldExpr;
+  Fix.NewText = NewExpr;
+  Fix.Description = "combine chained divisions into single division with multiplication";
+  return {Fix};
+}
+
 /// Fix VirtualDtorMissing: insert `virtual ` before `~ClassName`.
 static std::vector<AutoFix>
 fixVirtualDtorMissingStatic(const PerfHint &H, ASTContext &Ctx,
@@ -348,15 +736,21 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
     return fixVirtualDtorMissingStatic(Hint, Ctx, SM);
   case HintCategory::SmallFunctionInline:
     return fixSmallFunctionInline(Hint, Ctx);
-  // Categories that need structural or semantic changes — report only:
+  // Fixable categories with real source rewrites:
+  case HintCategory::StringConcatInLoop:
+    return fixStringConcatInLoopStatic(Hint, Ctx, SM);
+  case HintCategory::RegexInLoop:
+    return fixRegexInLoopStatic(Hint, Ctx, SM);
+  case HintCategory::ThrowInNoexcept:
+    return fixThrowInNoexceptStatic(Hint, Ctx, SM);
+  case HintCategory::DuplicateCondition:
+    return fixDuplicateConditionStatic(Hint, Ctx, SM);
   case HintCategory::DivisionChain:
+    return fixDivisionChainStatic(Hint, Ctx, SM);
+  // Categories that need structural or semantic changes — report only:
   case HintCategory::BranchOnFloat:
   case HintCategory::EmptyLoopBody:
-  case HintCategory::DuplicateCondition:
-  case HintCategory::StringConcatInLoop:
-  case HintCategory::RegexInLoop:
   case HintCategory::DynamicCastInLoop:
-  case HintCategory::ThrowInNoexcept:
   case HintCategory::GlobalVarInLoop:
   case HintCategory::VolatileInLoop:
   case HintCategory::ImplicitConversion:
