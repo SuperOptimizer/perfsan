@@ -270,16 +270,46 @@ PerfAutoFixer::fixConstexprPromotion(const PerfHint &H, ASTContext &Ctx) {
   const LangOptions &LO = Ctx.getLangOpts();
   SourceLocation Loc = H.SrcLoc;
 
-  // Look for "const " at or near the SrcLoc and replace with "constexpr ".
-  StringRef Snippet = getSourceSnippet(Loc, 128, SM, LO);
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
   if (Snippet.empty())
     return {};
 
+  // Don't touch virtual, override, or final functions — constexpr on those is tricky.
+  if (Snippet.contains("virtual") || Snippet.contains("override") ||
+      Snippet.contains("final"))
+    return {};
+
+  // For function constexpr promotion: insert "constexpr " before the return type.
+  // For variable constexpr promotion: replace "const " with "constexpr ".
+  // Distinguish: if there's a '(' it's a function, otherwise a variable.
+  bool IsFunction = Snippet.contains("(");
+
+  if (IsFunction) {
+    // Skip if already constexpr or if it's a class method with qualifiers
+    if (Snippet.ltrim().starts_with("constexpr"))
+      return {};
+    // Don't auto-fix methods — too many edge cases (const, override, virtual, final)
+    // Only fix free functions: no "const" after ")" and no class-related keywords
+    size_t RP = Snippet.find(')');
+    if (RP != StringRef::npos) {
+      StringRef After = Snippet.substr(RP + 1).ltrim();
+      if (After.starts_with("const") || After.starts_with("override") ||
+          After.starts_with("final"))
+        return {};
+    }
+    AutoFix Fix;
+    Fix.Loc = Loc;
+    Fix.FixKind = AutoFix::Insert;
+    Fix.NewText = "constexpr ";
+    Fix.Description = "add constexpr to enable compile-time evaluation";
+    return {Fix};
+  }
+
+  // Variable case: replace "const " with "constexpr "
   SourceLocation ConstLoc = findTextAfter(Loc, "const ", 128, SM, LO);
   if (ConstLoc.isInvalid())
     return {};
 
-  // Make sure we don't accidentally match "constexpr" already there.
   StringRef AtConst = getSourceSnippet(ConstLoc, 16, SM, LO);
   if (AtConst.starts_with("constexpr"))
     return {};
@@ -328,13 +358,26 @@ PerfAutoFixer::fixNoexcept(const PerfHint &H, ASTContext &Ctx) {
   if (CloseParen == StringRef::npos)
     return {};
 
-  // Check that "noexcept" isn't already present after the ')'.
+  // Check what follows the ')' — need to handle const, override, final, etc.
   StringRef AfterClose = Snippet.substr(CloseParen + 1);
   StringRef Trimmed = AfterClose.ltrim();
+
+  // Don't add noexcept if already present.
   if (Trimmed.starts_with("noexcept"))
     return {};
 
-  SourceLocation InsertLoc = Loc.getLocWithOffset(CloseParen + 1);
+  // Don't auto-fix virtual functions — noexcept changes the signature.
+  StringRef BeforeParen = Snippet.substr(0, OpenParen);
+  if (BeforeParen.contains("virtual"))
+    return {};
+
+  // Find the right insertion point: after 'const' if present, before '{' or ';'
+  size_t InsertOffset = CloseParen + 1;
+  if (Trimmed.starts_with("const")) {
+    InsertOffset = CloseParen + 1 + (AfterClose.size() - AfterClose.ltrim().size()) + 5; // skip " const"
+  }
+
+  SourceLocation InsertLoc = Loc.getLocWithOffset(InsertOffset);
 
   AutoFix Fix;
   Fix.Loc = InsertLoc;
@@ -547,7 +590,10 @@ PerfAutoFixer::fixRestrict(const PerfHint &H, ASTContext &Ctx) {
   if (Snippet.empty())
     return {};
 
-  size_t StarPos = Snippet.find('*');
+  // Only look for '*' before any '{' (stay in the declaration, not the body)
+  size_t BracePos = Snippet.find('{');
+  StringRef DeclPart = (BracePos != StringRef::npos) ? Snippet.substr(0, BracePos) : Snippet;
+  size_t StarPos = DeclPart.find('*');
   if (StarPos == StringRef::npos)
     return {};
 
@@ -555,13 +601,34 @@ PerfAutoFixer::fixRestrict(const PerfHint &H, ASTContext &Ctx) {
   if (Snippet.contains("__restrict__") || Snippet.contains("restrict"))
     return {};
 
-  // Insert " __restrict__" after the '*'.
+  // Verify the '*' is a pointer declarator, not multiplication.
+  // Heuristic: must be preceded by a type name (letter/digit) and followed
+  // by space+identifier or just identifier. Also reject if inside a function body.
+  if (StarPos > 0) {
+    char Before = Snippet[StarPos - 1];
+    // In "data[i] * 2.0f", before '*' is ']' or ' ' from an expression
+    if (Before == ']' || Before == ')' || std::isdigit(Before))
+      return {}; // multiplication, not pointer
+  }
+  if (StarPos + 1 < Snippet.size()) {
+    char After = Snippet[StarPos + 1];
+    // After pointer '*', expect space or identifier start
+    if (std::isdigit(After) || After == '(' || After == '[')
+      return {}; // multiplication context
+  }
+  // Also reject if the snippet doesn't look like a parameter declaration
+  // (should contain a type name before the *)
+  StringRef BeforeStar = Snippet.substr(0, StarPos).rtrim();
+  if (BeforeStar.empty() || BeforeStar.back() == '=' || BeforeStar.back() == ',')
+    return {};
+
+  // Insert " __restrict__ " after the '*' with proper spacing.
   SourceLocation InsertLoc = Loc.getLocWithOffset(StarPos + 1);
 
   AutoFix Fix;
   Fix.Loc = InsertLoc;
   Fix.FixKind = AutoFix::InsertAfter;
-  Fix.NewText = " __restrict__";
+  Fix.NewText = " __restrict__ ";
   Fix.Description = "add __restrict__ to enable alias analysis optimizations";
   return {Fix};
 }
@@ -575,11 +642,18 @@ PerfAutoFixer::fixConstVariable(const PerfHint &H, ASTContext &Ctx) {
   if (Snippet.empty())
     return {};
 
+  // Only apply to actual variable declarations, not method qualifiers.
+  // A "const " that's a variable qualifier appears before '=' or at line start.
+  // A "const" that's a method qualifier appears after ')'.
+  if (Snippet.contains("(") && Snippet.contains(")")) {
+    // Looks like a function — don't touch it
+    return {};
+  }
+
   SourceLocation ConstLoc = findTextAfter(Loc, "const ", 128, SM, LO);
   if (ConstLoc.isInvalid())
     return {};
 
-  // Don't double-convert if already constexpr.
   StringRef AtConst = getSourceSnippet(ConstLoc, 16, SM, LO);
   if (AtConst.starts_with("constexpr"))
     return {};
