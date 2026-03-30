@@ -84,6 +84,30 @@ const char *PerfHint::categoryName() const {
     return "lambda-capture-opt";
   case HintCategory::OutputParamToReturn:
     return "output-param-to-return";
+  case HintCategory::UnusedInclude:
+    return "unused-include";
+  case HintCategory::SmallFunctionNotInline:
+    return "small-function-not-inline";
+  case HintCategory::UnnecessaryCopy:
+    return "unnecessary-copy";
+  case HintCategory::RedundantComputation:
+    return "redundant-computation";
+  case HintCategory::TightLoopAllocation:
+    return "tight-loop-allocation";
+  case HintCategory::BoolBranching:
+    return "bool-branching";
+  case HintCategory::SortAlgorithm:
+    return "sort-algorithm";
+  case HintCategory::PowerOfTwo:
+    return "power-of-two";
+  case HintCategory::ExceptionInDestructor:
+    return "exception-in-destructor";
+  case HintCategory::VectorBoolAvoid:
+    return "vector-bool-avoid";
+  case HintCategory::MutexInLoop:
+    return "mutex-in-loop";
+  case HintCategory::StdFunctionOverhead:
+    return "std-function-overhead";
   }
   return "unknown";
 }

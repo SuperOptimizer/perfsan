@@ -14,10 +14,13 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/ParentMapContext.h"
 #include "clang/AST/Stmt.h"
+#include "clang/AST/StmtCXX.h"
 #include "clang/AST/StmtIterator.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/SourceManager.h"
 #include "llvm/ADT/StringRef.h"
+#include <cmath>
 
 using namespace perfsanitizer;
 using namespace clang;
@@ -574,4 +577,856 @@ void perfsanitizer::checkExcessiveCopy(const VarDecl *VD, ASTContext &Ctx,
                "Hoist the declaration outside the loop and call "
                ".clear() at the start of each iteration to reuse "
                "the existing allocation"));
+}
+
+// ---------------------------------------------------------------------------
+// 11. UnusedInclude (forward-declaration opportunity)
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkUnusedInclude(const FunctionDecl *FD, ASTContext &Ctx,
+                                       PerfHintCollector &Collector,
+                                       unsigned LoopDepth) {
+  if (!FD || !FD->hasBody())
+    return;
+
+  for (const ParmVarDecl *PVD : FD->parameters()) {
+    QualType T = PVD->getType();
+
+    // Only consider pointer or reference parameters.
+    if (!T->isPointerType() && !T->isReferenceType())
+      continue;
+
+    QualType Pointee = T->getPointeeType();
+    if (Pointee.isNull())
+      continue;
+
+    // Must be a record (class/struct) type.
+    const CXXRecordDecl *RD = Pointee->getAsCXXRecordDecl();
+    if (!RD || !RD->hasDefinition())
+      continue;
+
+    // If the function body never accesses members of this type beyond passing
+    // the pointer/reference through, a forward declaration would suffice.
+    // Heuristic: check if the parameter is only used in call expressions
+    // (passed to other functions) or simple comparisons, not member access.
+    bool NeedsFullDef = false;
+    const Stmt *Body = FD->getBody();
+
+    // Walk the body looking for MemberExpr or arrow expressions on this param.
+    std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+      if (!S || NeedsFullDef)
+        return;
+      if (const auto *ME = dyn_cast<MemberExpr>(S)) {
+        if (const auto *DRE =
+                dyn_cast<DeclRefExpr>(ME->getBase()->IgnoreImpCasts())) {
+          if (DRE->getDecl() == PVD)
+            NeedsFullDef = true;
+        }
+      }
+      // CXXMemberCallExpr on the param also needs full def.
+      if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(S)) {
+        if (const auto *IOA = MCE->getImplicitObjectArgument()) {
+          if (const auto *DRE =
+                  dyn_cast<DeclRefExpr>(IOA->IgnoreImpCasts())) {
+            if (DRE->getDecl() == PVD)
+              NeedsFullDef = true;
+          }
+        }
+      }
+      // sizeof, alignof on the type needs full def.
+      if (const auto *UETTE = dyn_cast<UnaryExprOrTypeTraitExpr>(S)) {
+        if (UETTE->getTypeOfArgument()->getAsCXXRecordDecl() == RD)
+          NeedsFullDef = true;
+      }
+      for (const Stmt *Child : S->children())
+        Walk(Child);
+    };
+    Walk(Body);
+
+    if (NeedsFullDef)
+      continue;
+
+    std::string Msg =
+        "Parameter '" + PVD->getNameAsString() + "' of type '" +
+        T.getAsString() +
+        "' only uses the type opaquely; the full class definition "
+        "may not be needed in this translation unit";
+
+    Collector.addHint(makeHint(HintCategory::UnusedInclude, Impact::Low,
+                               LoopDepth, PVD->getLocation(), Ctx, Msg,
+                               "Consider using a forward declaration instead "
+                               "of #including the full header to reduce "
+                               "compilation time"));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 12. SmallFunctionNotInline
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkSmallFunctionNotInline(const FunctionDecl *FD,
+                                                ASTContext &Ctx,
+                                                PerfHintCollector &Collector) {
+  if (!FD || !FD->hasBody())
+    return;
+
+  // Only flag functions in .cpp files (not headers).
+  const SourceManager &SM = Ctx.getSourceManager();
+  SourceLocation Loc = FD->getLocation();
+  if (Loc.isInvalid())
+    return;
+
+  llvm::StringRef Filename = SM.getFilename(SM.getSpellingLoc(Loc));
+  if (Filename.empty())
+    return;
+
+  // Consider it a header if it ends with .h, .hpp, .hxx, or .inc.
+  if (Filename.ends_with(".h") || Filename.ends_with(".hpp") ||
+      Filename.ends_with(".hxx") || Filename.ends_with(".inc"))
+    return;
+
+  // Skip if already inline, constexpr, or a template.
+  if (FD->isInlined() || FD->isConstexpr() || FD->isTemplateInstantiation())
+    return;
+  if (FD->getTemplatedKind() != FunctionDecl::TK_NonTemplate)
+    return;
+
+  // Skip main().
+  if (FD->isMain())
+    return;
+
+  // Count statements in the body.
+  const auto *Body = dyn_cast<CompoundStmt>(FD->getBody());
+  if (!Body)
+    return;
+
+  if (Body->size() > 3)
+    return;
+
+  std::string Msg =
+      "Function '" + FD->getNameAsString() + "' has only " +
+      std::to_string(Body->size()) +
+      " statement(s) but is not marked inline; call overhead may "
+      "exceed the function body cost";
+
+  Collector.addHint(
+      makeHint(HintCategory::SmallFunctionNotInline, Impact::Low,
+               /*LoopDepth=*/0, FD->getLocation(), Ctx, Msg,
+               "Consider marking this function 'inline' or moving it "
+               "to the header so the compiler can inline it at call sites"));
+}
+
+// ---------------------------------------------------------------------------
+// 13. UnnecessaryCopy
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkUnnecessaryCopy(const FunctionDecl *FD,
+                                         ASTContext &Ctx,
+                                         PerfHintCollector &Collector) {
+  if (!FD)
+    return;
+
+  for (const ParmVarDecl *PVD : FD->parameters()) {
+    QualType T = PVD->getType();
+
+    // Only flag pass-by-value (not reference, not pointer).
+    if (T->isReferenceType() || T->isPointerType())
+      continue;
+
+    // Skip fundamental/builtin types.
+    if (T->isBuiltinType() || T->isEnumeralType())
+      continue;
+
+    // Check if const-qualified value param — still a copy.
+    bool IsConst = T.isConstQualified();
+
+    // Check for well-known expensive types.
+    bool IsExpensiveName = typeNameContains(T, "basic_string") ||
+                           typeNameContains(T, "std::string") ||
+                           typeNameContains(T, "std::vector") ||
+                           typeNameContains(T, "std::map") ||
+                           typeNameContains(T, "std::unordered_map") ||
+                           typeNameContains(T, "std::set") ||
+                           typeNameContains(T, "std::list") ||
+                           typeNameContains(T, "std::deque");
+
+    // Check size > 64 bytes if we can determine it.
+    bool IsLargeType = false;
+    if (const RecordType *RT = T->getAs<RecordType>()) {
+      const RecordDecl *RD = RT->getDecl();
+      if (RD->isCompleteDefinition()) {
+        const ASTRecordLayout &Layout = Ctx.getASTRecordLayout(RD);
+        if (Layout.getSize().getQuantity() > 64)
+          IsLargeType = true;
+      }
+    }
+
+    // Check for non-trivial copy constructor.
+    bool HasNonTrivialCopy = false;
+    if (const auto *RD = T->getAsCXXRecordDecl()) {
+      if (RD->hasDefinition() && !RD->hasTrivialCopyConstructor())
+        HasNonTrivialCopy = true;
+    }
+
+    if (!IsExpensiveName && !IsLargeType && !HasNonTrivialCopy)
+      continue;
+
+    std::string Reason;
+    if (IsExpensiveName)
+      Reason = "has a non-trivial copy constructor";
+    else if (IsLargeType)
+      Reason = "is larger than 64 bytes";
+    else
+      Reason = "has a non-trivial copy constructor";
+
+    std::string Msg =
+        "Parameter '" + PVD->getNameAsString() + "' of type '" +
+        T.getAsString() + "' is passed by value but " + Reason +
+        "; this creates an expensive copy on every call";
+
+    std::string Sug = IsConst
+        ? "Change to 'const " + T.getUnqualifiedType().getAsString() + " &'"
+        : "Change to 'const " + T.getAsString() + " &' if the parameter "
+          "is not modified, or use move semantics if ownership is transferred";
+
+    Collector.addHint(makeHint(HintCategory::UnnecessaryCopy, Impact::Medium,
+                               /*LoopDepth=*/0, PVD->getLocation(), Ctx, Msg,
+                               Sug));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 14. RedundantComputation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Check if an expression references the given loop induction variable.
+bool referencesVar(const Stmt *S, const VarDecl *Var) {
+  if (!S)
+    return false;
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
+    if (DRE->getDecl() == Var)
+      return true;
+  }
+  for (const Stmt *Child : S->children()) {
+    if (referencesVar(Child, Var))
+      return true;
+  }
+  return false;
+}
+
+/// Try to extract the loop induction variable from a ForStmt's init.
+const VarDecl *getInductionVar(const ForStmt *FS) {
+  if (!FS->getInit())
+    return nullptr;
+  // int i = 0;
+  if (const auto *DS = dyn_cast<DeclStmt>(FS->getInit())) {
+    if (DS->isSingleDecl()) {
+      if (const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl()))
+        return VD;
+    }
+  }
+  // i = 0;
+  if (const auto *BO = dyn_cast<BinaryOperator>(FS->getInit())) {
+    if (BO->getOpcode() == BO_Assign) {
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreImpCasts()))
+        return dyn_cast<VarDecl>(DRE->getDecl());
+    }
+  }
+  return nullptr;
+}
+
+/// Check if a CallExpr is a call to strlen() or string::size()/string::length()
+/// that does NOT reference the given induction variable.
+bool isLoopInvariantSizeCall(const CallExpr *CE, const VarDecl *IndVar) {
+  if (!CE)
+    return false;
+
+  // Check for strlen(arg).
+  if (const FunctionDecl *Callee = CE->getDirectCallee()) {
+    if (Callee->getName() == "strlen" || Callee->getName() == "wcslen") {
+      // Check that args don't reference induction var.
+      for (unsigned I = 0; I < CE->getNumArgs(); ++I) {
+        if (IndVar && referencesVar(CE->getArg(I), IndVar))
+          return false;
+      }
+      return true;
+    }
+  }
+
+  // Check for .size() or .length() on a string/container.
+  if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(CE)) {
+    if (const CXXMethodDecl *MD = MCE->getMethodDecl()) {
+      llvm::StringRef Name = MD->getName();
+      if (Name == "size" || Name == "length") {
+        // The object should not reference the induction variable.
+        if (const Expr *Obj = MCE->getImplicitObjectArgument()) {
+          if (IndVar && referencesVar(Obj, IndVar))
+            return false;
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+} // anonymous namespace
+
+void perfsanitizer::checkRedundantComputation(const ForStmt *FS,
+                                              ASTContext &Ctx,
+                                              PerfHintCollector &Collector,
+                                              unsigned LoopDepth) {
+  if (!FS || !FS->getBody())
+    return;
+
+  const VarDecl *IndVar = getInductionVar(FS);
+
+  // Also check the condition for redundant calls like i < strlen(s).
+  auto CheckExpr = [&](const Stmt *S) {
+    if (!S)
+      return;
+    // Walk looking for call expressions.
+    std::function<void(const Stmt *)> Walk = [&](const Stmt *Node) {
+      if (!Node)
+        return;
+      if (const auto *CE = dyn_cast<CallExpr>(Node)) {
+        if (isLoopInvariantSizeCall(CE, IndVar)) {
+          std::string CallName;
+          if (const FunctionDecl *FCallee = CE->getDirectCallee())
+            CallName = FCallee->getNameAsString();
+          else if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(CE))
+            if (const CXXMethodDecl *MD = MCE->getMethodDecl())
+              CallName = MD->getQualifiedNameAsString();
+
+          std::string Msg =
+              "Call to '" + CallName +
+              "' is loop-invariant but recomputed every iteration "
+              "(loop depth " +
+              std::to_string(LoopDepth) + ")";
+
+          Collector.addHint(
+              makeHint(HintCategory::RedundantComputation, Impact::High,
+                       LoopDepth, CE->getBeginLoc(), Ctx, Msg,
+                       "Hoist the result into a variable before the loop"));
+        }
+      }
+      for (const Stmt *Child : Node->children())
+        Walk(Child);
+    };
+    Walk(S);
+  };
+
+  // Check the loop condition.
+  CheckExpr(FS->getCond());
+  // Check the loop body.
+  CheckExpr(FS->getBody());
+}
+
+// ---------------------------------------------------------------------------
+// 15. TightLoopAllocation
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkTightLoopAllocation(const Stmt *LoopBody,
+                                             ASTContext &Ctx,
+                                             PerfHintCollector &Collector,
+                                             unsigned LoopDepth) {
+  if (!LoopBody || LoopDepth == 0)
+    return;
+
+  std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+    if (!S)
+      return;
+
+    // Detect C++ new expressions.
+    if (const auto *NE = dyn_cast<CXXNewExpr>(S)) {
+      Collector.addHint(makeHint(
+          HintCategory::TightLoopAllocation, Impact::Critical, LoopDepth,
+          NE->getBeginLoc(), Ctx,
+          "Heap allocation via 'new' inside loop (depth " +
+              std::to_string(LoopDepth) +
+              "); each iteration triggers a malloc",
+          "Pre-allocate outside the loop, use an object pool, or "
+          "use stack allocation if the size is bounded"));
+      return; // Don't recurse into children of this new-expr.
+    }
+
+    // Detect function calls: malloc, calloc, make_unique, make_shared.
+    if (const auto *CE = dyn_cast<CallExpr>(S)) {
+      const FunctionDecl *Callee = CE->getDirectCallee();
+      if (Callee) {
+        llvm::StringRef Name = Callee->getName();
+        bool IsAlloc = (Name == "malloc" || Name == "calloc" ||
+                        Name == "realloc" || Name == "aligned_alloc");
+        if (!IsAlloc) {
+          // Check qualified name for std::make_unique, std::make_shared.
+          std::string QName = Callee->getQualifiedNameAsString();
+          IsAlloc = (llvm::StringRef(QName).contains("make_unique") ||
+                     llvm::StringRef(QName).contains("make_shared"));
+        }
+        if (IsAlloc) {
+          Collector.addHint(makeHint(
+              HintCategory::TightLoopAllocation, Impact::Critical, LoopDepth,
+              CE->getBeginLoc(), Ctx,
+              "Heap allocation via '" + Callee->getNameAsString() +
+                  "' inside loop (depth " + std::to_string(LoopDepth) +
+                  "); allocation in hot loops is a major performance issue",
+              "Pre-allocate outside the loop, reuse buffers, or use "
+              "stack-based allocation"));
+        }
+      }
+    }
+
+    for (const Stmt *Child : S->children())
+      Walk(Child);
+  };
+
+  Walk(LoopBody);
+}
+
+// ---------------------------------------------------------------------------
+// 16. BoolBranching
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Return true if \p S is `return true;` or `return false;`, and set \p Value.
+bool isReturnBool(const Stmt *S, bool &Value) {
+  const Stmt *Inner = S;
+  if (const auto *CS = dyn_cast<CompoundStmt>(S)) {
+    if (CS->size() != 1)
+      return false;
+    Inner = *CS->body_begin();
+  }
+  const auto *RS = dyn_cast<ReturnStmt>(Inner);
+  if (!RS || !RS->getRetValue())
+    return false;
+  const Expr *Ret = RS->getRetValue()->IgnoreImpCasts();
+  if (const auto *BL = dyn_cast<CXXBoolLiteralExpr>(Ret)) {
+    Value = BL->getValue();
+    return true;
+  }
+  // Also handle integer literal 0 or 1 in C-style code.
+  if (const auto *IL = dyn_cast<IntegerLiteral>(Ret)) {
+    uint64_t V = IL->getValue().getZExtValue();
+    if (V == 0 || V == 1) {
+      Value = (V == 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+} // anonymous namespace
+
+void perfsanitizer::checkBoolBranching(const IfStmt *IS, ASTContext &Ctx,
+                                       PerfHintCollector &Collector) {
+  if (!IS || !IS->getThen())
+    return;
+
+  bool ThenVal = false;
+  if (!isReturnBool(IS->getThen(), ThenVal))
+    return;
+
+  // Pattern 1: if (x) return true; else return false;
+  if (IS->getElse()) {
+    bool ElseVal = false;
+    if (!isReturnBool(IS->getElse(), ElseVal))
+      return;
+    if (ThenVal == ElseVal)
+      return; // Both return the same value — weird but not our check.
+
+    std::string Replacement =
+        ThenVal ? "return <condition>;" : "return !<condition>;";
+
+    Collector.addHint(
+        makeHint(HintCategory::BoolBranching, Impact::Low, /*LoopDepth=*/0,
+                 IS->getIfLoc(), Ctx,
+                 "Redundant bool branching: 'if (x) return true; else "
+                 "return false;' can be simplified",
+                 "Replace with '" + Replacement + "'"));
+    return;
+  }
+
+  // Pattern 2: if (x) return true; return false; (no else, next stmt is
+  // return false). We check if there's no else and the then-branch returns
+  // true — the caller would need to verify the next statement, but we flag
+  // the pattern conservatively.
+  if (ThenVal) {
+    Collector.addHint(
+        makeHint(HintCategory::BoolBranching, Impact::Low, /*LoopDepth=*/0,
+                 IS->getIfLoc(), Ctx,
+                 "Possible redundant bool branching: 'if (x) return true;' "
+                 "followed by 'return false;' can be simplified to "
+                 "'return x;'",
+                 "Replace with 'return <condition>;'"));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 17. SortAlgorithm
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Check if a statement contains a swap-like pattern (std::swap, manual
+/// temp-based swap, or direct member swap).
+bool containsSwap(const Stmt *S) {
+  if (!S)
+    return false;
+  if (const auto *CE = dyn_cast<CallExpr>(S)) {
+    if (const FunctionDecl *Callee = CE->getDirectCallee()) {
+      llvm::StringRef Name = Callee->getName();
+      if (Name == "swap" || Name == "iter_swap")
+        return true;
+      std::string QName = Callee->getQualifiedNameAsString();
+      if (llvm::StringRef(QName).contains("swap"))
+        return true;
+    }
+  }
+  // Also detect manual swap pattern: temp = a; a = b; b = temp;
+  // We simplify this to: look for 3 consecutive assignments in a compound.
+  if (const auto *CS = dyn_cast<CompoundStmt>(S)) {
+    unsigned AssignCount = 0;
+    for (const Stmt *Child : CS->body()) {
+      if (const auto *BO = dyn_cast<BinaryOperator>(Child)) {
+        if (BO->getOpcode() == BO_Assign)
+          AssignCount++;
+        else
+          AssignCount = 0;
+      } else {
+        AssignCount = 0;
+      }
+      if (AssignCount >= 3)
+        return true;
+    }
+  }
+  for (const Stmt *Child : S->children()) {
+    if (containsSwap(Child))
+      return true;
+  }
+  return false;
+}
+
+/// Check if a ForStmt's body contains a nested ForStmt.
+const ForStmt *findNestedFor(const Stmt *S) {
+  if (!S)
+    return nullptr;
+  for (const Stmt *Child : S->children()) {
+    if (const auto *Inner = dyn_cast<ForStmt>(Child))
+      return Inner;
+    if (const ForStmt *Found = findNestedFor(Child))
+      return Found;
+  }
+  return nullptr;
+}
+
+} // anonymous namespace
+
+void perfsanitizer::checkSortAlgorithm(const ForStmt *FS, ASTContext &Ctx,
+                                       PerfHintCollector &Collector,
+                                       unsigned LoopDepth) {
+  if (!FS || !FS->getBody())
+    return;
+
+  // Look for a nested for loop.
+  const ForStmt *Inner = findNestedFor(FS->getBody());
+  if (!Inner || !Inner->getBody())
+    return;
+
+  // The inner loop body (or the space between the two loops) should contain
+  // a swap or swap-like pattern.
+  if (!containsSwap(Inner->getBody()) && !containsSwap(FS->getBody()))
+    return;
+
+  std::string Msg =
+      "Nested loop with swap detected — this resembles a manual O(n^2) "
+      "sort (bubble sort or selection sort)";
+
+  Collector.addHint(
+      makeHint(HintCategory::SortAlgorithm, Impact::High, LoopDepth,
+               FS->getForLoc(), Ctx, Msg,
+               "Replace with std::sort (O(n log n)) or std::partial_sort "
+               "if only a subset is needed"));
+}
+
+// ---------------------------------------------------------------------------
+// 18. PowerOfTwo
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Return true if the value is a positive power of 2.
+bool isPowerOfTwo(uint64_t V) { return V > 0 && (V & (V - 1)) == 0; }
+
+/// Compute floor(log2(V)) for a power of 2.
+unsigned log2OfPow2(uint64_t V) {
+  unsigned Log = 0;
+  while (V > 1) {
+    V >>= 1;
+    ++Log;
+  }
+  return Log;
+}
+
+} // anonymous namespace
+
+void perfsanitizer::checkPowerOfTwo(const BinaryOperator *BO, ASTContext &Ctx,
+                                    PerfHintCollector &Collector,
+                                    unsigned LoopDepth) {
+  if (!BO)
+    return;
+
+  BinaryOperatorKind Op = BO->getOpcode();
+  if (Op != BO_Rem && Op != BO_Div)
+    return;
+
+  // RHS must be a positive integer literal that is a power of 2 (and > 1).
+  const Expr *RHS = BO->getRHS()->IgnoreImpCasts();
+  Expr::EvalResult Result;
+  if (!RHS->EvaluateAsInt(Result, Ctx))
+    return;
+
+  llvm::APSInt Val = Result.Val.getInt();
+  if (Val.isNegative() || Val.getExtValue() <= 1)
+    return;
+
+  uint64_t UVal = Val.getZExtValue();
+  if (!isPowerOfTwo(UVal))
+    return;
+
+  // LHS should be an unsigned or integer type (we still flag signed, but
+  // note the caveat).
+  QualType LHSTy = BO->getLHS()->getType();
+  bool IsSigned = LHSTy->isSignedIntegerType();
+
+  if (Op == BO_Rem) {
+    std::string Msg =
+        "Modulo by power-of-two constant (" + std::to_string(UVal) +
+        ") can be replaced with bitwise AND";
+    std::string Sug = "Replace 'x % " + std::to_string(UVal) + "' with 'x & " +
+                      std::to_string(UVal - 1) + "'";
+    if (IsSigned)
+      Sug += " (ensure x is non-negative or use unsigned type)";
+    Collector.addHint(makeHint(HintCategory::PowerOfTwo, Impact::Medium,
+                               LoopDepth, BO->getOperatorLoc(), Ctx, Msg, Sug));
+  } else {
+    // BO_Div
+    unsigned Shift = log2OfPow2(UVal);
+    std::string Msg =
+        "Division by power-of-two constant (" + std::to_string(UVal) +
+        ") can be replaced with right shift";
+    std::string Sug = "Replace 'x / " + std::to_string(UVal) + "' with 'x >> " +
+                      std::to_string(Shift) + "'";
+    if (IsSigned)
+      Sug += " (ensure x is non-negative or use unsigned type)";
+    Collector.addHint(makeHint(HintCategory::PowerOfTwo, Impact::Medium,
+                               LoopDepth, BO->getOperatorLoc(), Ctx, Msg, Sug));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 19. ExceptionInDestructor
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Recursively search for CXXThrowExpr within a statement tree.
+bool containsThrow(const Stmt *S) {
+  if (!S)
+    return false;
+  if (isa<CXXThrowExpr>(S))
+    return true;
+  for (const Stmt *Child : S->children()) {
+    if (containsThrow(Child))
+      return true;
+  }
+  return false;
+}
+
+} // anonymous namespace
+
+void perfsanitizer::checkExceptionInDestructor(const CXXDestructorDecl *DD,
+                                               ASTContext &Ctx,
+                                               PerfHintCollector &Collector) {
+  if (!DD || !DD->hasBody())
+    return;
+
+  const Stmt *Body = DD->getBody();
+
+  // Walk the body looking for throw expressions.
+  std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *TE = dyn_cast<CXXThrowExpr>(S)) {
+      std::string Msg =
+          "Throw expression inside destructor '" +
+          DD->getQualifiedNameAsString() +
+          "'; this can cause std::terminate if another exception is "
+          "already active, and prevents noexcept optimizations";
+
+      Collector.addHint(makeHint(
+          HintCategory::ExceptionInDestructor, Impact::High,
+          /*LoopDepth=*/0, TE->getThrowLoc(), Ctx, Msg,
+          "Remove the throw from the destructor; use error codes, "
+          "logging, or a separate cleanup method instead"));
+      return;
+    }
+    // Don't recurse into nested try/catch — throw inside catch in a
+    // destructor is still dangerous.
+    for (const Stmt *Child : S->children())
+      Walk(Child);
+  };
+
+  Walk(Body);
+}
+
+// ---------------------------------------------------------------------------
+// 20. VectorBoolAvoid
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkVectorBoolAvoid(const VarDecl *VD, ASTContext &Ctx,
+                                         PerfHintCollector &Collector) {
+  if (!VD)
+    return;
+
+  QualType T = VD->getType();
+  if (!typeNameContains(T, "vector<bool>"))
+    return;
+
+  std::string Msg =
+      "std::vector<bool> variable '" + VD->getNameAsString() +
+      "' uses a specialization that stores bits packed; this causes "
+      "poor performance due to bit manipulation overhead and inability "
+      "to take addresses of elements";
+
+  Collector.addHint(
+      makeHint(HintCategory::VectorBoolAvoid, Impact::Medium,
+               /*LoopDepth=*/0, VD->getLocation(), Ctx, Msg,
+               "Use std::vector<char>, std::vector<uint8_t>, or "
+               "std::bitset<N> (if size is fixed) instead"));
+}
+
+// ---------------------------------------------------------------------------
+// 21. MutexInLoop
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkMutexInLoop(const Stmt *LoopBody, ASTContext &Ctx,
+                                     PerfHintCollector &Collector,
+                                     unsigned LoopDepth) {
+  if (!LoopBody || LoopDepth == 0)
+    return;
+
+  std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+    if (!S)
+      return;
+
+    // Check variable declarations for lock_guard / unique_lock / scoped_lock.
+    if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+      for (const Decl *D : DS->decls()) {
+        if (const auto *VD = dyn_cast<VarDecl>(D)) {
+          QualType T = VD->getType();
+          if (typeNameContains(T, "lock_guard") ||
+              typeNameContains(T, "unique_lock") ||
+              typeNameContains(T, "scoped_lock")) {
+            Collector.addHint(makeHint(
+                HintCategory::MutexInLoop, Impact::High, LoopDepth,
+                VD->getLocation(), Ctx,
+                "Lock guard '" + VD->getNameAsString() +
+                    "' acquired inside loop (depth " +
+                    std::to_string(LoopDepth) +
+                    "); lock/unlock overhead on every iteration",
+                "Move the lock outside the loop, use lock-free "
+                "data structures, or batch operations to reduce "
+                "lock contention"));
+          }
+        }
+      }
+    }
+
+    // Check for explicit .lock() calls on mutex-like types.
+    if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(S)) {
+      if (const CXXMethodDecl *MD = MCE->getMethodDecl()) {
+        if (MD->getName() == "lock") {
+          QualType ObjTy;
+          if (const Expr *Obj = MCE->getImplicitObjectArgument())
+            ObjTy = Obj->getType();
+          if (typeNameContains(ObjTy, "mutex")) {
+            Collector.addHint(makeHint(
+                HintCategory::MutexInLoop, Impact::High, LoopDepth,
+                MCE->getBeginLoc(), Ctx,
+                "Explicit mutex.lock() call inside loop (depth " +
+                    std::to_string(LoopDepth) +
+                    "); lock acquisition on every iteration is expensive",
+                "Move the lock outside the loop, or use lock-free "
+                "algorithms / batching to reduce synchronization cost"));
+          }
+        }
+      }
+    }
+
+    for (const Stmt *Child : S->children())
+      Walk(Child);
+  };
+
+  Walk(LoopBody);
+}
+
+// ---------------------------------------------------------------------------
+// 22. StdFunctionOverhead (FunctionDecl overload — checks parameters)
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkStdFunctionOverhead(const FunctionDecl *FD,
+                                             ASTContext &Ctx,
+                                             PerfHintCollector &Collector,
+                                             unsigned LoopDepth) {
+  if (!FD)
+    return;
+
+  for (const ParmVarDecl *PVD : FD->parameters()) {
+    QualType T = PVD->getType().getNonReferenceType();
+    if (!typeNameContains(T, "function<"))
+      continue;
+
+    std::string Msg =
+        "Parameter '" + PVD->getNameAsString() +
+        "' uses std::function which has type-erasure overhead "
+        "(heap allocation for large callables, virtual dispatch)";
+
+    Collector.addHint(
+        makeHint(HintCategory::StdFunctionOverhead, Impact::Medium, LoopDepth,
+                 PVD->getLocation(), Ctx, Msg,
+                 "Consider using a template parameter (auto/Callable) "
+                 "or a function pointer if the callable type is known "
+                 "at compile time"));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 23. StdFunctionOverhead (VarDecl overload)
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkStdFunctionOverhead(const VarDecl *VD,
+                                             ASTContext &Ctx,
+                                             PerfHintCollector &Collector,
+                                             unsigned LoopDepth) {
+  if (!VD)
+    return;
+
+  QualType T = VD->getType();
+  if (!typeNameContains(T, "function<"))
+    return;
+
+  std::string Msg =
+      "Variable '" + VD->getNameAsString() +
+      "' uses std::function which incurs type-erasure overhead "
+      "(potential heap allocation, indirect call)";
+
+  Collector.addHint(
+      makeHint(HintCategory::StdFunctionOverhead, Impact::Medium, LoopDepth,
+               VD->getLocation(), Ctx, Msg,
+               "Use auto with a lambda, a function pointer, or a "
+               "template parameter to avoid std::function overhead"));
 }

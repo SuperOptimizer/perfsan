@@ -71,6 +71,18 @@ enum class HintCategory : uint8_t {
   ConstexprIf,
   LambdaCaptureOpt,
   OutputParamToReturn,
+  UnusedInclude,
+  SmallFunctionNotInline,
+  UnnecessaryCopy,
+  RedundantComputation,
+  TightLoopAllocation,
+  BoolBranching,
+  SortAlgorithm,
+  PowerOfTwo,
+  ExceptionInDestructor,
+  VectorBoolAvoid,
+  MutexInLoop,
+  StdFunctionOverhead,
 };
 
 /// A single performance hint with source location and impact score.

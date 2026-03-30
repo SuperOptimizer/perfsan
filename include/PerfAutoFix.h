@@ -69,6 +69,26 @@ private:
   std::vector<AutoFix> fixRestrict(const PerfHint &H, clang::ASTContext &Ctx);
   std::vector<AutoFix> fixConstVariable(const PerfHint &H,
                                          clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixPureConst(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixHeapToStack(const PerfHint &H,
+                                       clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixFMA(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixVirtualDevirt(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixAlignment(const PerfHint &H,
+                                     clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixDataLayout(const PerfHint &H,
+                                      clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixLoopInvariant(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixInlining(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixColdPath(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixContainerReserve(const PerfHint &H,
+                                            clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixStringByValue(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixRangeForConversion(const PerfHint &H,
+                                              clang::ASTContext &Ctx);
 };
 
 } // namespace perfsanitizer

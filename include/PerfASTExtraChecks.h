@@ -72,6 +72,79 @@ void checkStaticLocalInit(const clang::VarDecl *VD, clang::ASTContext &Ctx,
 void checkExcessiveCopy(const clang::VarDecl *VD, clang::ASTContext &Ctx,
                         PerfHintCollector &Collector, unsigned LoopDepth);
 
+/// Detect when a function parameter is a pointer/reference to a class type
+/// whose full definition may not be needed — a forward declaration would
+/// suffice, avoiding an #include.
+void checkUnusedInclude(const clang::FunctionDecl *FD, clang::ASTContext &Ctx,
+                        PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Detect small functions (<=3 statements) in .cpp files that are not marked
+/// inline. These incur call overhead that could be avoided.
+void checkSmallFunctionNotInline(const clang::FunctionDecl *FD,
+                                 clang::ASTContext &Ctx,
+                                 PerfHintCollector &Collector);
+
+/// Detect non-const pass-by-value parameters of types >64 bytes or types with
+/// non-trivial copy constructors (string, vector, map).
+void checkUnnecessaryCopy(const clang::FunctionDecl *FD, clang::ASTContext &Ctx,
+                          PerfHintCollector &Collector);
+
+/// In for loops, detect expressions that compute the same value every iteration
+/// but aren't hoisted (e.g., strlen(), string::size(), index computations not
+/// using the loop variable).
+void checkRedundantComputation(const clang::ForStmt *FS, clang::ASTContext &Ctx,
+                               PerfHintCollector &Collector,
+                               unsigned LoopDepth);
+
+/// Detect new/malloc/make_unique/make_shared inside for/while loops.
+/// Allocation in hot loops is almost always a performance bug.
+void checkTightLoopAllocation(const clang::Stmt *LoopBody,
+                              clang::ASTContext &Ctx,
+                              PerfHintCollector &Collector,
+                              unsigned LoopDepth);
+
+/// Detect `if (flag) return true; else return false;` or
+/// `if (x) return true; return false;` patterns that could be simplified.
+void checkBoolBranching(const clang::IfStmt *IS, clang::ASTContext &Ctx,
+                        PerfHintCollector &Collector);
+
+/// Detect manual bubble sort / selection sort patterns (nested for loops with
+/// swap). Suggest std::sort.
+void checkSortAlgorithm(const clang::ForStmt *FS, clang::ASTContext &Ctx,
+                        PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Detect `x % N` where N is a power of 2 (could be `x & (N-1)`) and
+/// `x / N` where N is a power of 2 (could be `x >> log2(N)`).
+void checkPowerOfTwo(const clang::BinaryOperator *BO, clang::ASTContext &Ctx,
+                     PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Detect throw expressions inside destructors.
+void checkExceptionInDestructor(const clang::CXXDestructorDecl *DD,
+                                clang::ASTContext &Ctx,
+                                PerfHintCollector &Collector);
+
+/// Detect std::vector<bool> which is a notoriously slow specialization.
+void checkVectorBoolAvoid(const clang::VarDecl *VD, clang::ASTContext &Ctx,
+                          PerfHintCollector &Collector);
+
+/// Detect lock_guard/unique_lock/mutex.lock() inside loops.
+void checkMutexInLoop(const clang::Stmt *LoopBody, clang::ASTContext &Ctx,
+                      PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Detect std::function used as parameters or in variable declarations.
+/// Overload for FunctionDecl (checks parameters).
+void checkStdFunctionOverhead(const clang::FunctionDecl *FD,
+                              clang::ASTContext &Ctx,
+                              PerfHintCollector &Collector,
+                              unsigned LoopDepth);
+
+/// Detect std::function used in variable declarations.
+/// Overload for VarDecl.
+void checkStdFunctionOverhead(const clang::VarDecl *VD,
+                              clang::ASTContext &Ctx,
+                              PerfHintCollector &Collector,
+                              unsigned LoopDepth);
+
 } // namespace perfsanitizer
 
 #endif // PERFSANITIZER_PERFASTEXTRACHECKS_H
