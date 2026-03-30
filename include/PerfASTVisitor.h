@@ -8,6 +8,7 @@
 #define PERFSANITIZER_PERFASTVISITOR_H
 
 #include "PerfHint.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Basic/SourceManager.h"
@@ -55,6 +56,32 @@ private:
 
   /// Get the enclosing function name.
   std::string getEnclosingFunctionName(clang::SourceLocation Loc);
+
+  /// Check for cold path outlining opportunities in an if-statement.
+  void checkColdPathOutlining(clang::IfStmt *S);
+
+  /// Check for loop unswitching opportunities (loop-invariant conditions).
+  void checkLoopUnswitching(clang::Stmt *LoopBody, clang::SourceLocation Loc);
+
+  /// Check for missing [[nodiscard]] on function declarations.
+  void checkMissingNodiscard(clang::FunctionDecl *FD);
+
+  /// Check for discarded return values at call sites.
+  void checkDiscardedReturnValue(clang::CallExpr *CE);
+
+  /// Check for signed loop counter vs unsigned bound.
+  void checkSignedLoopCounter(clang::ForStmt *S);
+
+  /// Check if a given expression references any of the given local variables.
+  bool referencesAnyVar(const clang::Expr *E,
+                        const llvm::SmallPtrSetImpl<const clang::VarDecl *> &Vars);
+
+  /// Collect variables declared within a statement subtree.
+  void collectLocalVars(const clang::Stmt *S,
+                        llvm::SmallPtrSetImpl<const clang::VarDecl *> &Vars);
+
+  /// Count statements in a compound statement (non-recursive top level).
+  unsigned countStatements(const clang::Stmt *S);
 };
 
 class PerfASTConsumer : public clang::ASTConsumer {

@@ -56,6 +56,13 @@ enum class HintCategory : uint8_t {
   MoveSemantics,
   DataLayout,
   BranchlessSelect,
+  SoAvsAoS,
+  ColdPathOutlining,
+  LoopUnswitching,
+  SIMDWidth,
+  StrengthReduction,
+  MissingNodiscard,
+  SignedLoopCounter,
 };
 
 /// A single performance hint with source location and impact score.

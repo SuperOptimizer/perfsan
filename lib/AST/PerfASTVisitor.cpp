@@ -6,12 +6,14 @@
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/StmtCXX.h"
 #include "clang/AST/Type.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/Basic/ExceptionSpecificationType.h"
 #include "clang/Basic/SourceManager.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace perfsanitizer;
 using namespace clang;
@@ -92,6 +94,326 @@ bool PerfASTVisitor::isCompileTimeConstant(const Expr *E) {
 std::string PerfASTVisitor::getEnclosingFunctionName(SourceLocation Loc) {
   // This is a best-effort helper; the visitor context usually knows this.
   return "";
+}
+
+unsigned PerfASTVisitor::countStatements(const Stmt *S) {
+  if (!S)
+    return 0;
+  if (const auto *CS = dyn_cast<CompoundStmt>(S))
+    return CS->size();
+  return 1;
+}
+
+void PerfASTVisitor::collectLocalVars(
+    const Stmt *S, llvm::SmallPtrSetImpl<const VarDecl *> &Vars) {
+  if (!S)
+    return;
+  if (const auto *DS = dyn_cast<DeclStmt>(S)) {
+    for (const auto *D : DS->decls()) {
+      if (const auto *VD = dyn_cast<VarDecl>(D))
+        Vars.insert(VD);
+    }
+  }
+  for (const Stmt *Child : S->children())
+    collectLocalVars(Child, Vars);
+}
+
+bool PerfASTVisitor::referencesAnyVar(
+    const Expr *E, const llvm::SmallPtrSetImpl<const VarDecl *> &Vars) {
+  if (!E)
+    return false;
+  if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+    if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+      if (Vars.count(VD))
+        return true;
+    }
+  }
+  for (const Stmt *Child : E->children()) {
+    if (const auto *ChildExpr = dyn_cast_or_null<Expr>(Child)) {
+      if (referencesAnyVar(ChildExpr, Vars))
+        return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Cold path outlining — large blocks in error-handling branches
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkColdPathOutlining(IfStmt *S) {
+  auto isErrorBranch = [](const Stmt *Branch) -> bool {
+    if (!Branch)
+      return false;
+    // Check for throw
+    if (isa<CXXThrowExpr>(Branch))
+      return true;
+    if (const auto *CS = dyn_cast<CompoundStmt>(Branch)) {
+      for (const auto *Child : CS->body()) {
+        if (isa<CXXThrowExpr>(Child))
+          return true;
+        if (const auto *RS = dyn_cast<ReturnStmt>(Child)) {
+          // Return of error code (negative, 0, nullptr, false)
+          if (const auto *IL =
+                  dyn_cast_or_null<IntegerLiteral>(RS->getRetValue())) {
+            if (IL->getValue().isNegative() || IL->getValue() == 0)
+              return true;
+          }
+          if (isa_and_nonnull<CXXNullPtrLiteralExpr>(RS->getRetValue()))
+            return true;
+        }
+        // Check for calls to abort/exit/_Exit
+        if (const auto *CE = dyn_cast<CallExpr>(Child)) {
+          if (const auto *Callee = CE->getDirectCallee()) {
+            StringRef Name = Callee->getName();
+            if (Name == "abort" || Name == "exit" || Name == "_Exit" ||
+                Name == "terminate" || Name == "quick_exit")
+              return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  const Stmt *Then = S->getThen();
+  const Stmt *Else = S->getElse();
+
+  // Check then-branch
+  if (isErrorBranch(Then) && countStatements(Then) > 5) {
+    Collector.addHint(makeHint(
+        HintCategory::ColdPathOutlining, Impact::Medium, S->getBeginLoc(),
+        "Error-handling branch has " + std::to_string(countStatements(Then)) +
+            " statements — large cold block mixed with hot path.",
+        "Move the error-handling code to a separate __attribute__((cold)) "
+        "function, or add __attribute__((cold)) to the enclosing path to "
+        "improve instruction cache utilization on the hot path."));
+  }
+
+  // Check else-branch
+  if (isErrorBranch(Else) && countStatements(Else) > 5) {
+    Collector.addHint(makeHint(
+        HintCategory::ColdPathOutlining, Impact::Medium, S->getElseLoc(),
+        "Error-handling else-branch has " +
+            std::to_string(countStatements(Else)) +
+            " statements — large cold block mixed with hot path.",
+        "Move the error-handling code to a separate __attribute__((cold)) "
+        "function to improve instruction cache utilization on the hot path."));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loop unswitching — loop-invariant conditions inside loops
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkLoopUnswitching(Stmt *LoopStmt,
+                                          SourceLocation Loc) {
+  if (!LoopStmt)
+    return;
+
+  // Collect all variables that are local to the loop.
+  llvm::SmallPtrSet<const VarDecl *, 16> LoopLocalVars;
+
+  // Determine the actual loop body and collect vars from the full loop.
+  const Stmt *Body = nullptr;
+  if (auto *For = dyn_cast<ForStmt>(LoopStmt)) {
+    // Collect vars from init, cond, inc, and body.
+    if (For->getInit())
+      collectLocalVars(For->getInit(), LoopLocalVars);
+    if (For->getInc())
+      collectLocalVars(For->getInc(), LoopLocalVars);
+    Body = For->getBody();
+  } else if (auto *While = dyn_cast<WhileStmt>(LoopStmt)) {
+    Body = While->getBody();
+  } else {
+    Body = LoopStmt;
+  }
+
+  if (Body)
+    collectLocalVars(Body, LoopLocalVars);
+
+  // Walk the top-level statements of the loop body looking for if-statements.
+  auto CheckBody = [&](const Stmt *B) {
+    if (!B)
+      return;
+    const CompoundStmt *CS = dyn_cast<CompoundStmt>(B);
+    if (!CS)
+      return;
+    for (const auto *Child : CS->body()) {
+      const auto *If = dyn_cast<IfStmt>(Child);
+      if (!If)
+        continue;
+      const Expr *Cond = If->getCond();
+      if (!Cond)
+        continue;
+      // If the condition doesn't reference any loop-local variables,
+      // it's a candidate for unswitching.
+      if (!referencesAnyVar(Cond, LoopLocalVars)) {
+        Collector.addHint(makeHint(
+            HintCategory::LoopUnswitching, Impact::High, If->getBeginLoc(),
+            "If-condition inside loop does not reference any loop-local "
+            "variables — branch is loop-invariant.",
+            "Hoist the condition outside the loop (loop unswitching): create "
+            "two copies of the loop, one for each branch. This eliminates a "
+            "branch from every iteration."));
+      }
+    }
+  };
+
+  CheckBody(Body);
+}
+
+// ---------------------------------------------------------------------------
+// Missing [[nodiscard]] detection
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkMissingNodiscard(FunctionDecl *FD) {
+  // Skip if already has nodiscard/warn_unused_result
+  if (FD->hasAttr<WarnUnusedResultAttr>())
+    return;
+  // Skip void functions
+  if (FD->getReturnType()->isVoidType())
+    return;
+  // Skip constructors/destructors
+  if (isa<CXXConstructorDecl>(FD) || isa<CXXDestructorDecl>(FD))
+    return;
+  // Skip operators (many have conventional usage patterns)
+  if (FD->isOverloadedOperator())
+    return;
+
+  bool ShouldFlag = false;
+  std::string Reason;
+
+  // Check for pure/const attribute — definitely should be nodiscard
+  if (FD->hasAttr<PureAttr>() || FD->hasAttr<ConstAttr>()) {
+    ShouldFlag = true;
+    Reason = "has __attribute__((pure/const)) but no [[nodiscard]] — "
+             "discarding the return value means the call is useless";
+  }
+  // Check for functions returning non-void with scalar or pointer return
+  // that look like they should be checked (getters, compute functions)
+  else if (FD->getReturnType()->isScalarType() && FD->param_size() > 0 &&
+           !FD->hasBody()) {
+    // We only flag declarations without bodies to reduce noise — the
+    // return-value-discarded check at call sites handles the rest.
+  }
+
+  if (ShouldFlag) {
+    Collector.addHint(makeHint(
+        HintCategory::MissingNodiscard, Impact::Medium, FD->getLocation(),
+        "Function '" + FD->getNameAsString() + "' " + Reason + ".",
+        "Add [[nodiscard]] to the declaration to warn callers who discard "
+        "the return value."));
+  }
+}
+
+void PerfASTVisitor::checkDiscardedReturnValue(CallExpr *CE) {
+  const FunctionDecl *Callee = CE->getDirectCallee();
+  if (!Callee)
+    return;
+  if (Callee->getReturnType()->isVoidType())
+    return;
+
+  // Check if this CallExpr's result is used. We do this by checking if the
+  // parent is a compound statement (i.e., the call is an expression-statement).
+  auto Parents = Ctx.getParents(*CE);
+  if (Parents.empty())
+    return;
+
+  // If the direct parent is a CompoundStmt or an ExprWithCleanups whose
+  // parent is a CompoundStmt, the return value is discarded.
+  bool Discarded = false;
+  const Stmt *Parent = Parents[0].get<Stmt>();
+  if (Parent && isa<CompoundStmt>(Parent)) {
+    Discarded = true;
+  } else if (Parent && isa<ExprWithCleanups>(Parent)) {
+    auto GrandParents = Ctx.getParents(*Parent);
+    if (!GrandParents.empty()) {
+      const Stmt *GP = GrandParents[0].get<Stmt>();
+      if (GP && isa<CompoundStmt>(GP))
+        Discarded = true;
+    }
+  }
+
+  if (!Discarded)
+    return;
+
+  // Flag if the callee is pure/const or already has nodiscard
+  bool IsPureConst =
+      Callee->hasAttr<PureAttr>() || Callee->hasAttr<ConstAttr>();
+  bool HasNodiscard = Callee->hasAttr<WarnUnusedResultAttr>();
+
+  if (IsPureConst && !HasNodiscard) {
+    Collector.addHint(makeHint(
+        HintCategory::MissingNodiscard,
+        CurrentLoopDepth > 0 ? Impact::High : Impact::Medium,
+        CE->getBeginLoc(),
+        "Return value of pure/const function '" +
+            Callee->getNameAsString() +
+            "' is discarded — the call has no effect.",
+        "Use the return value or remove the call. Add [[nodiscard]] to the "
+        "function declaration to catch this at compile time."));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Signed loop counter detection
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkSignedLoopCounter(ForStmt *S) {
+  // Look at the init statement for a VarDecl with signed int type.
+  const Stmt *Init = S->getInit();
+  if (!Init)
+    return;
+
+  const VarDecl *CounterVar = nullptr;
+  if (const auto *DS = dyn_cast<DeclStmt>(Init)) {
+    if (DS->isSingleDecl()) {
+      if (const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl())) {
+        QualType T = VD->getType();
+        if (T->isSignedIntegerType() && !T->isBooleanType())
+          CounterVar = VD;
+      }
+    }
+  }
+
+  if (!CounterVar)
+    return;
+
+  // Check the condition for comparison against an unsigned type.
+  const Expr *Cond = S->getCond();
+  if (!Cond)
+    return;
+
+  const BinaryOperator *BO = dyn_cast<BinaryOperator>(Cond);
+  if (!BO)
+    return;
+
+  if (!BO->isRelationalOp() && !BO->isEqualityOp())
+    return;
+
+  // Check if either side is unsigned/size_t.
+  auto isUnsignedExpr = [](const Expr *E) -> bool {
+    if (!E)
+      return false;
+    QualType T = E->getType();
+    return T->isUnsignedIntegerType();
+  };
+
+  bool HasUnsignedBound = isUnsignedExpr(BO->getLHS()) ||
+                          isUnsignedExpr(BO->getRHS());
+
+  if (HasUnsignedBound) {
+    Collector.addHint(makeHint(
+        HintCategory::SignedLoopCounter, Impact::Medium, S->getBeginLoc(),
+        "Loop counter '" + CounterVar->getNameAsString() +
+            "' is signed but compared against an unsigned bound — "
+            "signed overflow is undefined behavior, limiting optimizations.",
+        "Use 'unsigned', 'size_t', or the appropriate unsigned type for the "
+        "loop counter to match the bound type. This enables the compiler to "
+        "assume wrap-around semantics and apply more aggressive "
+        "optimizations."));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +532,9 @@ bool PerfASTVisitor::VisitFunctionDecl(FunctionDecl *FD) {
           "CSE and dead call elimination."));
     }
   }
+
+  // 5. Missing [[nodiscard]] check
+  checkMissingNodiscard(FD);
 
   return true;
 }
@@ -370,6 +695,13 @@ bool PerfASTVisitor::VisitForStmt(ForStmt *S) {
     }
   }
 
+  // Check for signed loop counter vs unsigned bound
+  checkSignedLoopCounter(S);
+
+  // Check for loop unswitching opportunities.
+  // Pass the full for-statement so init-declared variables are included.
+  checkLoopUnswitching(S, S->getBeginLoc());
+
   // Check for loop-invariant function calls in the condition
   if (S->getCond()) {
     std::function<void(const Stmt *)> FindCalls = [&](const Stmt *St) {
@@ -414,6 +746,9 @@ bool PerfASTVisitor::VisitWhileStmt(WhileStmt *S) {
       "If the iteration count is bounded, consider converting to a for-loop "
       "with a known upper bound, or add __builtin_assume for the bound."));
 
+  // Check for loop unswitching opportunities
+  checkLoopUnswitching(S, S->getBeginLoc());
+
   --CurrentLoopDepth;
   return true;
 }
@@ -427,6 +762,9 @@ bool PerfASTVisitor::VisitIfStmt(IfStmt *S) {
     return true;
 
   // Suggest [[likely]]/[[unlikely]] for error-handling patterns
+  // Check for cold path outlining opportunities (works with or without else)
+  checkColdPathOutlining(S);
+
   if (S->getElse()) {
     // Check if one branch is a return/throw (error path)
     const Stmt *Then = S->getThen();
@@ -481,6 +819,9 @@ bool PerfASTVisitor::VisitIfStmt(IfStmt *S) {
 bool PerfASTVisitor::VisitCallExpr(CallExpr *CE) {
   if (SM.isInSystemHeader(CE->getBeginLoc()))
     return true;
+
+  // Check for discarded return values
+  checkDiscardedReturnValue(CE);
 
   const FunctionDecl *Callee = CE->getDirectCallee();
   if (!Callee)

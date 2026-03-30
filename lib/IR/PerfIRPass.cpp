@@ -1,6 +1,7 @@
 //===- PerfIRPass.cpp - LLVM IR performance analysis pass -----------------===//
 
 #include "PerfIRPass.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -77,6 +78,9 @@ void PerfIRPass::analyzeFunction(Function &F, FunctionAnalysisManager &FAM) {
   checkInliningCandidates(F, FAM);
   checkBranchPatterns(F, FAM);
   checkDataLayoutIssues(F);
+  checkSoAvsAoS(F, FAM);
+  checkSIMDWidth(F, FAM);
+  checkStrengthReduction(F, FAM);
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +444,244 @@ void PerfIRPass::checkDataLayoutIssues(Function &F) {
               "performance penalty on some architectures.",
               "Ensure the underlying data is properly aligned (alignas or "
               "aligned allocation).",
+              F.getName()));
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SoA vs AoS detection — strided GEP patterns in loops
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkSoAvsAoS(Function &F, FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    unsigned Depth = L->getLoopDepth();
+
+    // Track struct-field GEP accesses: map from base pointer
+    // to set of field indices accessed. We key on just the pointer since
+    // the struct type is determined by the GEP source element type.
+    DenseMap<Value *, SmallSet<unsigned, 8>> StructFieldAccesses;
+    DenseMap<Value *, Type *> BaseStructType;
+
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+        if (!GEP)
+          continue;
+
+        // Look for GEPs into struct types with constant field indices.
+        // Pattern: getelementptr %struct.Foo, ptr %base, i64 %idx, i32 <field>
+        Type *SrcElemTy = GEP->getSourceElementType();
+        if (!SrcElemTy->isStructTy())
+          continue;
+
+        // Need at least 2 indices: an array index and a struct field index.
+        if (GEP->getNumIndices() < 2)
+          continue;
+
+        // The last index should be a constant (struct field index).
+        auto IdxIt = GEP->idx_end();
+        --IdxIt;
+        auto *FieldIdx = dyn_cast<ConstantInt>(IdxIt->get());
+        if (!FieldIdx)
+          continue;
+
+        // The first index should be loop-varying (array index).
+        auto FirstIdx = GEP->idx_begin();
+        if (L->isLoopInvariant(FirstIdx->get()))
+          continue;
+
+        Value *Base = GEP->getPointerOperand();
+        StructFieldAccesses[Base].insert(FieldIdx->getZExtValue());
+        BaseStructType[Base] = SrcElemTy;
+      }
+    }
+
+    // If multiple fields of the same struct are accessed in the loop,
+    // this is an AoS pattern that could benefit from SoA.
+    for (auto &[Base, Fields] : StructFieldAccesses) {
+      if (Fields.size() >= 2) {
+        // Find a representative instruction for the diagnostic location.
+        Instruction *Rep = nullptr;
+        for (BasicBlock *BB : L->blocks()) {
+          for (Instruction &I : *BB) {
+            if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+              if (GEP->getPointerOperand() == Base &&
+                  GEP->getSourceElementType() == BaseStructType[Base]) {
+                Rep = &I;
+                break;
+              }
+            }
+          }
+          if (Rep)
+            break;
+        }
+
+        unsigned Score = scaleByLoopDepth(Impact::High, Depth);
+        Collector.addHint(makeIRHint(
+            HintCategory::SoAvsAoS, Score, Rep,
+            "Loop accesses " + std::to_string(Fields.size()) +
+                " different fields of the same struct array (AoS pattern) — "
+                "strided accesses inhibit vectorization.",
+            "Restructure to Structure-of-Arrays (SoA): use separate parallel "
+            "arrays for each field to enable contiguous memory access and "
+            "auto-vectorization.",
+            F.getName()));
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SIMD width hints — loops on float/double arrays without vectorization
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkSIMDWidth(Function &F, FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    unsigned Depth = L->getLoopDepth();
+    bool HasFloatOps = false;
+    bool HasVectorOps = false;
+    bool HasVectorizePragma = false;
+    unsigned FloatLoadStoreCount = 0;
+
+    // Check for llvm.loop metadata indicating vectorization pragmas.
+    if (BasicBlock *Latch = L->getLoopLatch()) {
+      if (Instruction *Term = Latch->getTerminator()) {
+        if (MDNode *LoopMD = Term->getMetadata(LLVMContext::MD_loop)) {
+          for (unsigned I = 1, E = LoopMD->getNumOperands(); I < E; ++I) {
+            if (auto *InnerMD = dyn_cast<MDNode>(LoopMD->getOperand(I))) {
+              if (InnerMD->getNumOperands() > 0) {
+                if (auto *S = dyn_cast<MDString>(InnerMD->getOperand(0))) {
+                  if (S->getString().starts_with("llvm.loop.vectorize"))
+                    HasVectorizePragma = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (HasVectorizePragma)
+      continue;
+
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        Type *Ty = I.getType();
+        if (Ty->isVectorTy()) {
+          HasVectorOps = true;
+          break;
+        }
+        if (Ty->isFloatTy() || Ty->isDoubleTy()) {
+          if (I.isBinaryOp())
+            HasFloatOps = true;
+        }
+        if (auto *LdI = dyn_cast<LoadInst>(&I)) {
+          Type *LoadTy = LdI->getType();
+          if (LoadTy->isFloatTy() || LoadTy->isDoubleTy())
+            ++FloatLoadStoreCount;
+        }
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+          Type *ValTy = SI->getValueOperand()->getType();
+          if (ValTy->isFloatTy() || ValTy->isDoubleTy())
+            ++FloatLoadStoreCount;
+        }
+      }
+      if (HasVectorOps)
+        break;
+    }
+
+    // If there are scalar float operations in the loop with multiple
+    // load/stores and no vector ops, suggest vectorization.
+    if (HasFloatOps && !HasVectorOps && FloatLoadStoreCount >= 4) {
+      BasicBlock *Header = L->getHeader();
+      Instruction *Rep = Header->empty() ? nullptr : &Header->front();
+      unsigned Score = scaleByLoopDepth(Impact::High, Depth);
+      Collector.addHint(makeIRHint(
+          HintCategory::SIMDWidth, Score, Rep,
+          "Loop performs scalar floating-point operations with " +
+              std::to_string(FloatLoadStoreCount) +
+              " float/double load/stores but no vectorization.",
+          "Add '#pragma clang loop vectorize(enable)' before the loop, or "
+          "use explicit SIMD types (__m128, __m256) for guaranteed "
+          "vectorization.",
+          F.getName()));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Strength reduction — div/mod by non-power-of-2 constants in loops
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkStrengthReduction(Function &F,
+                                        FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+  for (BasicBlock &BB : F) {
+    unsigned LoopDepth = LI.getLoopDepth(&BB);
+    if (LoopDepth == 0)
+      continue;
+
+    for (Instruction &I : BB) {
+      unsigned Opcode = I.getOpcode();
+      bool IsDiv = (Opcode == Instruction::SDiv || Opcode == Instruction::UDiv);
+      bool IsRem = (Opcode == Instruction::SRem || Opcode == Instruction::URem);
+      bool IsMul = (Opcode == Instruction::Mul);
+
+      if (!IsDiv && !IsRem && !IsMul)
+        continue;
+
+      // Check if the RHS operand is a constant integer.
+      auto *CI = dyn_cast<ConstantInt>(I.getOperand(1));
+      if (!CI)
+        continue;
+
+      uint64_t Val = CI->getZExtValue();
+      if (Val == 0)
+        continue;
+
+      bool IsPowerOf2 = (Val & (Val - 1)) == 0;
+
+      if ((IsDiv || IsRem) && !IsPowerOf2) {
+        unsigned Score = scaleByLoopDepth(Impact::High, LoopDepth);
+        std::string OpStr = IsDiv ? "Division" : "Modulo";
+        Collector.addHint(makeIRHint(
+            HintCategory::StrengthReduction, Score, &I,
+            OpStr + " by non-power-of-2 constant " + std::to_string(Val) +
+                " inside a loop — requires expensive multiply+shift sequence.",
+            "If possible, round the divisor to a power of 2 (enables shift "
+            "replacement), or precompute a reciprocal multiplier. Consider "
+            "restructuring the algorithm to avoid the division.",
+            F.getName()));
+      }
+
+      if (IsMul && !IsPowerOf2 && Val > 2) {
+        // Check if the constant could be expressed as a small shift+add.
+        // e.g., x*3 = (x<<1)+x, x*5 = (x<<2)+x, x*9 = (x<<3)+x
+        bool IsShiftAdd = false;
+        for (unsigned Shift = 1; Shift < 6; ++Shift) {
+          uint64_t Base = 1ULL << Shift;
+          if (Val == Base + 1 || Val == Base - 1)
+            IsShiftAdd = true;
+        }
+        // Only emit for non-trivial multiplications that the compiler
+        // might not already strength-reduce.
+        if (!IsShiftAdd) {
+          unsigned Score = scaleByLoopDepth(Impact::Medium, LoopDepth);
+          Collector.addHint(makeIRHint(
+              HintCategory::StrengthReduction, Score, &I,
+              "Multiplication by constant " + std::to_string(Val) +
+                  " inside a loop — may benefit from strength reduction.",
+              "Consider replacing with equivalent shift-and-add operations "
+              "if the compiler hasn't already done so, or restructure to "
+              "use incremental addition.",
               F.getName()));
         }
       }

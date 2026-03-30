@@ -54,6 +54,20 @@ const char *PerfHint::categoryName() const {
     return "data-layout";
   case HintCategory::BranchlessSelect:
     return "branchless-select";
+  case HintCategory::SoAvsAoS:
+    return "soa-vs-aos";
+  case HintCategory::ColdPathOutlining:
+    return "cold-path-outlining";
+  case HintCategory::LoopUnswitching:
+    return "loop-unswitching";
+  case HintCategory::SIMDWidth:
+    return "simd-width";
+  case HintCategory::StrengthReduction:
+    return "strength-reduction";
+  case HintCategory::MissingNodiscard:
+    return "missing-nodiscard";
+  case HintCategory::SignedLoopCounter:
+    return "signed-loop-counter";
   }
   return "unknown";
 }

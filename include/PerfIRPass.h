@@ -43,6 +43,10 @@ private:
   void checkBranchPatterns(llvm::Function &F,
                            llvm::FunctionAnalysisManager &FAM);
   void checkDataLayoutIssues(llvm::Function &F);
+  void checkSoAvsAoS(llvm::Function &F, llvm::FunctionAnalysisManager &FAM);
+  void checkSIMDWidth(llvm::Function &F, llvm::FunctionAnalysisManager &FAM);
+  void checkStrengthReduction(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &FAM);
 };
 
 } // namespace perfsanitizer
