@@ -1107,7 +1107,7 @@ bool containsSwap(const Stmt *S) {
     }
   }
   for (const Stmt *Child : S->children()) {
-    if (containsSwap(Child))
+    if (Child && containsSwap(Child))
       return true;
   }
   return false;
@@ -1118,6 +1118,8 @@ const ForStmt *findNestedFor(const Stmt *S) {
   if (!S)
     return nullptr;
   for (const Stmt *Child : S->children()) {
+    if (!Child)
+      continue;
     if (const auto *Inner = dyn_cast<ForStmt>(Child))
       return Inner;
     if (const ForStmt *Found = findNestedFor(Child))
