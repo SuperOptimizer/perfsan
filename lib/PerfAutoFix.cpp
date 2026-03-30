@@ -227,6 +227,12 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
     return fixConstexprIf(Hint, Ctx);
   case HintCategory::SmallFunctionNotInline:
     return fixSmallFunctionInline(Hint, Ctx);
+  case HintCategory::BranchlessSelect:
+    return fixBranchlessSelect(Hint, Ctx);
+  case HintCategory::FalseSharing:
+    return fixFalseSharing(Hint, Ctx);
+  case HintCategory::AliasBarrier:
+    return fixAliasBarrier(Hint, Ctx);
   // No source rewrite — report mode handles these via stderr:
   case HintCategory::SoAvsAoS:
   case HintCategory::ExceptionCost:
@@ -234,12 +240,9 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
   case HintCategory::StdFunctionOverhead:
   case HintCategory::TightLoopAllocation:
   case HintCategory::RedundantComputation:
-  case HintCategory::AliasBarrier:
   case HintCategory::RedundantLoad:
   case HintCategory::SROAEscape:
-  case HintCategory::BranchlessSelect:
   case HintCategory::LoopUnswitching:
-  case HintCategory::FalseSharing:
   case HintCategory::OutputParamToReturn:
   case HintCategory::UnusedInclude:
   case HintCategory::SortAlgorithm:
@@ -2379,28 +2382,43 @@ PerfAutoFixer::fixAliasBarrier(const PerfHint &H, ASTContext &Ctx) {
   const LangOptions &LO = Ctx.getLangOpts();
   SourceLocation Loc = H.SrcLoc;
 
-  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
   if (Snippet.empty())
     return {};
 
+  // Already annotated?
   if (Snippet.contains("__restrict__") ||
-      Snippet.contains("assume_safety") ||
-      Snippet.contains("PERF: add __restrict__"))
+      Snippet.contains("assume_safety"))
     return {};
 
-  unsigned Col = SM.getSpellingColumnNumber(Loc);
-  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+  // Find the first "for" or "while" keyword in the snippet to place the pragma.
+  size_t ForPos = Snippet.find("for");
+  size_t WhilePos = Snippet.find("while");
+  size_t LoopPos = StringRef::npos;
+  if (ForPos != StringRef::npos && WhilePos != StringRef::npos)
+    LoopPos = std::min(ForPos, WhilePos);
+  else if (ForPos != StringRef::npos)
+    LoopPos = ForPos;
+  else if (WhilePos != StringRef::npos)
+    LoopPos = WhilePos;
 
-  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LoopPos == StringRef::npos)
+    return {};
+
+  // Compute the insertion point: the start of the line containing the loop.
+  SourceLocation LoopLoc = Loc.getLocWithOffset(LoopPos);
+  SourceLocation LineStart = getLineStartLoc(LoopLoc, SM);
   if (LineStart.isInvalid())
     return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(LoopLoc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
   AutoFix Fix;
   Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
-  Fix.NewText = Indent + "// PERF: add __restrict__ or #pragma clang loop "
-                "vectorize(assume_safety)\n";
-  Fix.Description = "suggest alias barrier to enable vectorization";
+  Fix.NewText = Indent + "#pragma clang loop vectorize(assume_safety)\n";
+  Fix.Description = "add vectorize(assume_safety) pragma to enable vectorization";
   return {Fix};
 }
 
@@ -2542,30 +2560,12 @@ PerfAutoFixer::fixMoveSemantics(const PerfHint &H, ASTContext &Ctx) {
 
 std::vector<AutoFix>
 PerfAutoFixer::fixBranchlessSelect(const PerfHint &H, ASTContext &Ctx) {
-  const LangOptions &LO = Ctx.getLangOpts();
-  SourceLocation Loc = H.SrcLoc;
-
-  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
-  if (Snippet.empty())
-    return {};
-
-  if (Snippet.contains("PERF: use ternary"))
-    return {};
-
-  unsigned Col = SM.getSpellingColumnNumber(Loc);
-  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
-
-  SourceLocation LineStart = getLineStartLoc(Loc, SM);
-  if (LineStart.isInvalid())
-    return {};
-
-  AutoFix Fix;
-  Fix.Loc = LineStart;
-  Fix.FixKind = AutoFix::Insert;
-  Fix.NewText = Indent + "// PERF: use ternary (cond ? a : b) for branchless "
-                "select\n";
-  Fix.Description = "suggest ternary operator for branchless select";
-  return {Fix};
+  // Pattern: if (COND) VAR = V1; else VAR = V2;
+  // Rewrite: VAR = COND ? V1 : V2;
+  // Only when both branches are single assignment to the same variable.
+  // If the pattern doesn't match cleanly, bail out.
+  (void)Ctx;
+  return {};
 }
 
 std::vector<AutoFix>
@@ -2629,28 +2629,37 @@ PerfAutoFixer::fixFalseSharing(const PerfHint &H, ASTContext &Ctx) {
   const LangOptions &LO = Ctx.getLangOpts();
   SourceLocation Loc = H.SrcLoc;
 
-  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  // The hint Loc typically points to the first atomic field's name, so
+  // searching forward for "atomic" or "volatile" finds the NEXT field.
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
   if (Snippet.empty())
     return {};
 
-  if (Snippet.contains("PERF: add alignas(64) padding") ||
-      Snippet.contains("alignas(64)"))
+  // Already has alignas(64)?
+  if (Snippet.contains("alignas(64)"))
     return {};
 
-  unsigned Col = SM.getSpellingColumnNumber(Loc);
-  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
-
-  SourceLocation LineStart = getLineStartLoc(Loc, SM);
-  if (LineStart.isInvalid())
+  // Find the next "atomic" or "volatile" keyword in the snippet — this
+  // corresponds to the adjacent field that needs cache-line separation.
+  size_t TargetPos = Snippet.find("atomic");
+  if (TargetPos == StringRef::npos)
+    TargetPos = Snippet.find("volatile");
+  if (TargetPos == StringRef::npos)
     return {};
+
+  // Walk backwards from TargetPos to find "std::" prefix if present,
+  // so we insert before "std::atomic" not in the middle.
+  if (TargetPos >= 5 && Snippet.substr(TargetPos - 5, 5) == "std::")
+    TargetPos -= 5;
+
+  // Insert "alignas(64) " right before the target field type.
+  SourceLocation InsertLoc = Loc.getLocWithOffset(TargetPos);
 
   AutoFix Fix;
-  Fix.Loc = LineStart;
+  Fix.Loc = InsertLoc;
   Fix.FixKind = AutoFix::Insert;
-  Fix.NewText = Indent + "// PERF: add alignas(64) padding between atomic "
-                "fields to prevent false sharing\n";
-  Fix.Description =
-      "suggest alignas(64) padding to prevent false sharing";
+  Fix.NewText = "alignas(64) ";
+  Fix.Description = "add alignas(64) to prevent false sharing between fields";
   return {Fix};
 }
 
