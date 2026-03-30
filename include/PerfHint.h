@@ -83,6 +83,12 @@ enum class HintCategory : uint8_t {
   VectorBoolAvoid,
   MutexInLoop,
   StdFunctionOverhead,
+  SharedPtrOverhead,
+  BitManipulation,
+  RedundantAtomic,
+  CacheLineSplit,
+  CrossTUInlining,
+  HotColdFunction,
 };
 
 /// A single performance hint with source location and impact score.

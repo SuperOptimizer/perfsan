@@ -89,6 +89,32 @@ private:
                                          clang::ASTContext &Ctx);
   std::vector<AutoFix> fixRangeForConversion(const PerfHint &H,
                                               clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixTailCall(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixExceptionInDestructor(const PerfHint &H,
+                                                 clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixVectorBool(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixSharedPtr(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixUnnecessaryCopy(const PerfHint &H,
+                                           clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixBoolBranching(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixPowerOfTwo(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixSoAComment(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixVectorizePragma(const PerfHint &H,
+                                           clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixExceptionComment(const PerfHint &H,
+                                            clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixMutexComment(const PerfHint &H,
+                                        clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixStdFunctionComment(const PerfHint &H,
+                                              clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixLoopBound(const PerfHint &H, clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixLambdaCapture(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixTightAllocComment(const PerfHint &H,
+                                             clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixRedundantComputComment(const PerfHint &H,
+                                                  clang::ASTContext &Ctx);
 };
 
 } // namespace perfsanitizer

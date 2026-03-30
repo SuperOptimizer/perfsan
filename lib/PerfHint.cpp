@@ -108,6 +108,18 @@ const char *PerfHint::categoryName() const {
     return "mutex-in-loop";
   case HintCategory::StdFunctionOverhead:
     return "std-function-overhead";
+  case HintCategory::SharedPtrOverhead:
+    return "shared-ptr-overhead";
+  case HintCategory::BitManipulation:
+    return "bit-manipulation";
+  case HintCategory::RedundantAtomic:
+    return "redundant-atomic";
+  case HintCategory::CacheLineSplit:
+    return "cache-line-split";
+  case HintCategory::CrossTUInlining:
+    return "cross-tu-inlining";
+  case HintCategory::HotColdFunction:
+    return "hot-cold-function";
   }
   return "unknown";
 }

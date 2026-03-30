@@ -1,0 +1,118 @@
+#!/bin/bash
+# perfsan — convenience wrapper for PerfSanitizer
+#
+# Usage:
+#   perfsan check file.cpp            # report hints
+#   perfsan fix file.cpp              # auto-fix in place
+#   perfsan diff file.cpp             # show proposed fixes as diff
+#   perfsan check --json file.cpp     # JSON output
+#   perfsan check --min-score=75 file.cpp  # only high-impact hints
+#   perfsan count file.cpp            # just hint count
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN="${PERFSAN_PLUGIN:-$SCRIPT_DIR/../build/PerfSanitizer.so}"
+CXX="${PERFSAN_CXX:-clang++}"
+CXXFLAGS="${PERFSAN_CXXFLAGS:--std=c++20 -O2}"
+
+if [ ! -f "$PLUGIN" ]; then
+  echo "error: PerfSanitizer.so not found at $PLUGIN" >&2
+  echo "Build it first: cmake --build build" >&2
+  echo "Or set PERFSAN_PLUGIN=/path/to/PerfSanitizer.so" >&2
+  exit 1
+fi
+
+usage() {
+  cat <<'EOF'
+perfsan — Performance Sanitizer for C/C++
+
+Usage:
+  perfsan check [options] file.cpp [file2.cpp ...]
+  perfsan fix [options] file.cpp [file2.cpp ...]
+  perfsan diff [options] file.cpp [file2.cpp ...]
+  perfsan count [options] file.cpp [file2.cpp ...]
+
+Modes:
+  check     Show sorted performance hints (default)
+  fix       Auto-fix and rewrite source files in place
+  diff      Show proposed fixes as unified diff
+  count     Just print the hint count
+
+Options:
+  --min-score=N     Only show hints with score >= N (0-200)
+  --json            Output as JSON (check mode only)
+  --color           Force colored output
+  --no-color        Disable colored output
+  -std=c++XX        C++ standard (default: c++20)
+  -ON               Optimization level (default: O2)
+
+Environment:
+  PERFSAN_PLUGIN    Path to PerfSanitizer.so
+  PERFSAN_CXX       C++ compiler (default: clang++)
+  PERFSAN_CXXFLAGS  Additional compiler flags
+
+Examples:
+  perfsan check mylib.cpp
+  perfsan fix --min-score=75 src/*.cpp
+  perfsan diff --json main.cpp
+  perfsan count -std=c++17 -O3 file.cpp
+EOF
+  exit 0
+}
+
+[ $# -eq 0 ] && usage
+
+MODE="report"
+PLUGIN_ARGS=()
+EXTRA_FLAGS=()
+FILES=()
+
+case "$1" in
+  check)  MODE="report"; shift ;;
+  fix)    MODE="fix"; shift ;;
+  diff)   MODE="diff"; shift ;;
+  count)  MODE="quiet"; shift ;;
+  help|--help|-h) usage ;;
+  *) ;; # no mode specified, treat as check
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --min-score=*)
+      PLUGIN_ARGS+=(-Xclang -plugin-arg-perf-sanitizer -Xclang "min-score=${1#*=}")
+      shift ;;
+    --json)
+      PLUGIN_ARGS+=(-Xclang -plugin-arg-perf-sanitizer -Xclang json)
+      shift ;;
+    --color|--no-color)
+      shift ;; # TODO: implement
+    -std=*|-O*)
+      EXTRA_FLAGS+=("$1")
+      shift ;;
+    -*)
+      EXTRA_FLAGS+=("$1")
+      shift ;;
+    *)
+      FILES+=("$1")
+      shift ;;
+  esac
+done
+
+if [ ${#FILES[@]} -eq 0 ]; then
+  echo "error: no input files" >&2
+  exit 1
+fi
+
+# Build the plugin args
+if [ "$MODE" != "report" ]; then
+  PLUGIN_ARGS+=(-Xclang -plugin-arg-perf-sanitizer -Xclang "$MODE")
+fi
+
+for FILE in "${FILES[@]}"; do
+  if [ ! -f "$FILE" ]; then
+    echo "error: $FILE not found" >&2
+    continue
+  fi
+  $CXX -fplugin="$PLUGIN" "${PLUGIN_ARGS[@]}" $CXXFLAGS "${EXTRA_FLAGS[@]}" -c "$FILE" -o /dev/null
+done

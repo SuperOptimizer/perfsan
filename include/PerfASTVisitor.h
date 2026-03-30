@@ -27,6 +27,7 @@ public:
   bool VisitCXXRecordDecl(clang::CXXRecordDecl *RD);
   bool VisitCXXMethodDecl(clang::CXXMethodDecl *MD);
   bool VisitFieldDecl(clang::FieldDecl *FD);
+  bool VisitCXXDestructorDecl(clang::CXXDestructorDecl *DD);
 
   // Statement/expression visitors
   bool VisitForStmt(clang::ForStmt *S);

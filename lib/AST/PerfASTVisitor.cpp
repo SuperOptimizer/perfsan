@@ -1,6 +1,7 @@
 //===- PerfASTVisitor.cpp - AST-level performance hint detection ----------===//
 
 #include "PerfASTVisitor.h"
+#include "PerfASTExtraChecks.h"
 #include "PerfAutoFix.h"
 #include "PerfFixItEmitter.h"
 #include "clang/AST/Attr.h"
@@ -1122,6 +1123,11 @@ bool PerfASTVisitor::VisitFunctionDecl(FunctionDecl *FD) {
   // 7. Output parameter to return value check
   checkOutputParamToReturn(FD);
 
+  // Extra checks from PerfASTExtraChecks
+  checkSmallFunctionNotInline(FD, Ctx, Collector);
+  checkUnnecessaryCopy(FD, Ctx, Collector);
+  checkStdFunctionOverhead(FD, Ctx, Collector, 0);
+
   return true;
 }
 
@@ -1144,6 +1150,15 @@ bool PerfASTVisitor::VisitVarDecl(VarDecl *VD) {
           "folded at compile time in all contexts."));
     }
   }
+
+  // Extra checks from PerfASTExtraChecks
+  checkMapToUnorderedMap(VD, Ctx, Collector, CurrentLoopDepth);
+  checkVectorBoolAvoid(VD, Ctx, Collector);
+  checkStaticLocalInit(VD, Ctx, Collector, CurrentLoopDepth);
+  checkExcessiveCopy(VD, Ctx, Collector, CurrentLoopDepth);
+  checkStdFunctionOverhead(VD, Ctx, Collector, CurrentLoopDepth);
+  if (const auto *PVD = dyn_cast<ParmVarDecl>(VD))
+    checkSharedPtrOverhead(PVD, Ctx, Collector, CurrentLoopDepth);
 
   // restrict suggestion for pointer parameters
   if (VD->getType()->isPointerType() && isa<ParmVarDecl>(VD)) {
@@ -1321,6 +1336,13 @@ bool PerfASTVisitor::VisitForStmt(ForStmt *S) {
   // Check for push_back/emplace_back without reserve().
   checkContainerReserve(S->getBody(), S->getBeginLoc());
 
+  // Extra checks from PerfASTExtraChecks
+  checkRedundantComputation(S, Ctx, Collector, CurrentLoopDepth);
+  checkTightLoopAllocation(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkSortAlgorithm(S, Ctx, Collector, CurrentLoopDepth);
+  checkMemcpyOpportunity(S, Ctx, Collector, CurrentLoopDepth);
+  checkMutexInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+
   // After visiting children, decrement.
   // Note: RecursiveASTVisitor handles child traversal; we manage depth here.
   // We'll decrement in a post-order fashion via TraverseForStmt override
@@ -1346,6 +1368,10 @@ bool PerfASTVisitor::VisitWhileStmt(WhileStmt *S) {
 
   // Check for push_back/emplace_back without reserve().
   checkContainerReserve(S->getBody(), S->getBeginLoc());
+
+  // Extra checks from PerfASTExtraChecks
+  checkTightLoopAllocation(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkMutexInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
 
   --CurrentLoopDepth;
   return true;
@@ -1410,6 +1436,10 @@ bool PerfASTVisitor::VisitIfStmt(IfStmt *S) {
     }
   }
 
+  // Extra checks from PerfASTExtraChecks
+  checkBoolBranching(S, Ctx, Collector);
+  checkBranchFreePredicate(S, Ctx, Collector, CurrentLoopDepth);
+
   return true;
 }
 
@@ -1460,6 +1490,10 @@ bool PerfASTVisitor::VisitCallExpr(CallExpr *CE) {
         "Consider -ffast-math or #pragma STDC FP_CONTRACT ON if "
         "precision tolerance allows — enables FMA and SIMD math."));
   }
+
+  // Extra checks from PerfASTExtraChecks
+  checkSmallVectorSize(CE, Ctx, Collector, CurrentLoopDepth);
+  checkVirtualInLoop(CE, Ctx, Collector, CurrentLoopDepth);
 
   return true;
 }
@@ -1542,6 +1576,10 @@ bool PerfASTVisitor::VisitBinaryOperator(BinaryOperator *BO) {
   // Detect select-like ternary that could be branchless
   // (This is handled at IfStmt level for full if/else patterns)
 
+  // Extra checks from PerfASTExtraChecks
+  checkPowerOfTwo(BO, Ctx, Collector, CurrentLoopDepth);
+  checkEmptyVsSize(BO, Ctx, Collector, CurrentLoopDepth);
+
   return true;
 }
 
@@ -1565,6 +1603,20 @@ bool PerfASTVisitor::VisitLambdaExpr(LambdaExpr *LE) {
     return true;
 
   checkLambdaCaptureOpt(LE);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Destructor declarations — exception safety
+// ---------------------------------------------------------------------------
+
+bool PerfASTVisitor::VisitCXXDestructorDecl(CXXDestructorDecl *DD) {
+  if (!DD->doesThisDeclarationHaveABody())
+    return true;
+  if (SM.isInSystemHeader(DD->getLocation()))
+    return true;
+
+  checkExceptionInDestructor(DD, Ctx, Collector);
   return true;
 }
 

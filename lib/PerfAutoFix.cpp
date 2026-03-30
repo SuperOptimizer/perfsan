@@ -126,12 +126,43 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
   case HintCategory::ColdPathOutlining:
     return fixColdPath(Hint, Ctx);
   case HintCategory::ContainerReserve:
-    // TODO: container reserve fix needs better scope analysis to be safe
-    return {};
+    return fixContainerReserve(Hint, Ctx);
   case HintCategory::StringByValue:
     return fixStringByValue(Hint, Ctx);
   case HintCategory::RangeForConversion:
     return fixRangeForConversion(Hint, Ctx);
+  case HintCategory::TailCall:
+    return fixTailCall(Hint, Ctx);
+  case HintCategory::ExceptionInDestructor:
+    return fixExceptionInDestructor(Hint, Ctx);
+  case HintCategory::VectorBoolAvoid:
+    return fixVectorBool(Hint, Ctx);
+  case HintCategory::SharedPtrOverhead:
+    return fixSharedPtr(Hint, Ctx);
+  case HintCategory::UnnecessaryCopy:
+    return fixUnnecessaryCopy(Hint, Ctx);
+  case HintCategory::BoolBranching:
+    return fixBoolBranching(Hint, Ctx);
+  case HintCategory::PowerOfTwo:
+    return fixPowerOfTwo(Hint, Ctx);
+  case HintCategory::SoAvsAoS:
+    return fixSoAComment(Hint, Ctx);
+  case HintCategory::Vectorization:
+    return fixVectorizePragma(Hint, Ctx);
+  case HintCategory::ExceptionCost:
+    return fixExceptionComment(Hint, Ctx);
+  case HintCategory::MutexInLoop:
+    return fixMutexComment(Hint, Ctx);
+  case HintCategory::StdFunctionOverhead:
+    return fixStdFunctionComment(Hint, Ctx);
+  case HintCategory::LoopBound:
+    return fixLoopBound(Hint, Ctx);
+  case HintCategory::LambdaCaptureOpt:
+    return fixLambdaCapture(Hint, Ctx);
+  case HintCategory::TightLoopAllocation:
+    return fixTightAllocComment(Hint, Ctx);
+  case HintCategory::RedundantComputation:
+    return fixRedundantComputComment(Hint, Ctx);
   default:
     return {};
   }
@@ -1240,6 +1271,20 @@ PerfAutoFixer::fixContainerReserve(const PerfHint &H, ASTContext &Ctx) {
   if (!SimpleBound)
     return {};
 
+  // Scope check: only allow integer literals or local variables visible before
+  // the loop. Integer literals start with a digit. For variable names, verify
+  // the identifier appears in the source text before the for loop.
+  if (!Bound.empty() && !std::isdigit(Bound[0])) {
+    // It's a variable name — check it appears before the for loop in the
+    // surrounding context. Read up to 1024 chars before the loop.
+    unsigned FileOffset = SM.getFileOffset(Loc);
+    unsigned ScanBack = std::min(FileOffset, 1024u);
+    SourceLocation ContextStart = Loc.getLocWithOffset(-(int)ScanBack);
+    StringRef PreContext = getSourceSnippet(ContextStart, ScanBack, SM, LO);
+    if (PreContext.empty() || !PreContext.contains(Bound))
+      return {};
+  }
+
   // Find push_back in the loop body to identify the container.
   size_t PushPos = Snippet.find("push_back");
   if (PushPos == StringRef::npos)
@@ -1412,6 +1457,690 @@ PerfAutoFixer::fixRangeForConversion(const PerfHint &H, ASTContext &Ctx) {
       Indent +
       "// PERF: consider range-for: for (auto& elem : container)\n";
   Fix.Description = "suggest range-based for loop conversion";
+  return {Fix};
+}
+
+//===----------------------------------------------------------------------===//
+// New auto-fix generators (batch 2)
+//===----------------------------------------------------------------------===//
+
+std::vector<AutoFix>
+PerfAutoFixer::fixTailCall(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Find "return " at or near SrcLoc.
+  SourceLocation RetLoc = findTextAfter(Loc, "return ", 256, SM, LO);
+  if (RetLoc.isInvalid())
+    return {};
+
+  // Check that [[clang::musttail]] isn't already present.
+  StringRef AtRet = getSourceSnippet(RetLoc, 64, SM, LO);
+  if (AtRet.contains("musttail"))
+    return {};
+
+  // Verify there's a function call after "return ".
+  StringRef AfterReturn = getSourceSnippet(RetLoc.getLocWithOffset(7), 128, SM, LO);
+  if (AfterReturn.empty() || !AfterReturn.contains("("))
+    return {};
+
+  AutoFix Fix;
+  Fix.Loc = RetLoc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = "[[clang::musttail]] ";
+  Fix.Description = "add [[clang::musttail]] to enable tail call optimization";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixExceptionInDestructor(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Already noexcept?
+  if (Snippet.contains("noexcept"))
+    return {};
+
+  // Find the closing ')' of the destructor parameter list.
+  size_t OpenParen = Snippet.find('(');
+  if (OpenParen == StringRef::npos)
+    return {};
+
+  unsigned Depth = 0;
+  size_t CloseParen = StringRef::npos;
+  for (size_t I = OpenParen; I < Snippet.size(); ++I) {
+    if (Snippet[I] == '(')
+      ++Depth;
+    else if (Snippet[I] == ')') {
+      --Depth;
+      if (Depth == 0) {
+        CloseParen = I;
+        break;
+      }
+    }
+  }
+  if (CloseParen == StringRef::npos)
+    return {};
+
+  SourceLocation InsertLoc = Loc.getLocWithOffset(CloseParen + 1);
+
+  AutoFix Fix;
+  Fix.Loc = InsertLoc;
+  Fix.FixKind = AutoFix::InsertAfter;
+  Fix.NewText = " noexcept";
+  Fix.Description = "add noexcept to destructor declaration";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixVectorBool(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  SourceLocation VBLoc = findTextAfter(Loc, "vector<bool>", 256, SM, LO);
+  if (VBLoc.isInvalid())
+    return {};
+
+  AutoFix Fix;
+  Fix.Loc = VBLoc;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = "vector<bool>";
+  Fix.NewText = "vector<char>";
+  Fix.Description = "replace vector<bool> with vector<char> to avoid bitfield overhead";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixSharedPtr(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Look for "shared_ptr<...> param" pattern (by value).
+  // Already const ref?
+  if (Snippet.contains("const") && Snippet.contains("&"))
+    return {};
+
+  // Find "shared_ptr<".
+  SourceLocation SPLoc = findTextAfter(Loc, "shared_ptr<", 256, SM, LO);
+  if (SPLoc.isInvalid())
+    return {};
+
+  // Read from shared_ptr< to find the closing '>' and param name.
+  StringRef FromSP = getSourceSnippet(SPLoc, 256, SM, LO);
+  if (FromSP.empty())
+    return {};
+
+  // Find the closing '>'.
+  unsigned Depth = 0;
+  size_t CloseAngle = StringRef::npos;
+  for (size_t I = 10; I < FromSP.size(); ++I) { // skip "shared_ptr"
+    if (FromSP[I] == '<')
+      ++Depth;
+    else if (FromSP[I] == '>') {
+      --Depth;
+      if (Depth == 0) {
+        CloseAngle = I;
+        break;
+      }
+    }
+  }
+  if (CloseAngle == StringRef::npos)
+    return {};
+
+  // Extract the full type including shared_ptr<T>.
+  StringRef SPType = FromSP.substr(0, CloseAngle + 1);
+
+  // After the type, expect a space and param name. Check for '&' (already ref).
+  StringRef AfterType = FromSP.substr(CloseAngle + 1).ltrim();
+  if (AfterType.starts_with("&"))
+    return {};
+
+  // Check for std:: prefix before shared_ptr.
+  unsigned SPOffset = SM.getFileOffset(SPLoc) - SM.getFileOffset(Loc);
+  std::string OldType;
+  std::string NewType;
+  if (SPOffset >= 5) {
+    StringRef BeforeSP = Snippet.substr(SPOffset - 5, 5);
+    if (BeforeSP == "std::") {
+      OldType = ("std::" + SPType).str();
+      NewType = ("const std::" + SPType + "&").str();
+      SPLoc = SPLoc.getLocWithOffset(-5);
+    } else {
+      OldType = SPType.str();
+      NewType = ("const " + SPType + "&").str();
+    }
+  } else {
+    OldType = SPType.str();
+    NewType = ("const " + SPType + "&").str();
+  }
+
+  AutoFix Fix;
+  Fix.Loc = SPLoc;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = OldType;
+  Fix.NewText = NewType;
+  Fix.Description = "pass shared_ptr by const reference to avoid refcount overhead";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixUnnecessaryCopy(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Already a reference?
+  if (Snippet.contains("&"))
+    return {};
+  // Already const ref?
+  if (Snippet.contains("const"))
+    return {};
+
+  // The hint message should contain the type name. We look for a pattern
+  // like "Type param" in the snippet. Find the first '(' to locate params.
+  // If we're at the param directly, look for the space before the param name.
+  // Heuristic: insert "const " before and "& " replacing " " after type.
+  // This is inherently tricky — be conservative.
+
+  // Look for the first identifier followed by space and another identifier
+  // (type followed by param name). Only handle simple single-word types.
+  size_t SpacePos = Snippet.find(' ');
+  if (SpacePos == StringRef::npos || SpacePos == 0)
+    return {};
+
+  StringRef TypePart = Snippet.substr(0, SpacePos);
+  // Validate type is a simple identifier.
+  for (char C : TypePart) {
+    if (!isalnum(C) && C != '_' && C != ':')
+      return {};
+  }
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = (TypePart + " ").str();
+  Fix.NewText = ("const " + TypePart + "& ").str();
+  Fix.Description = "pass large parameter by const reference to avoid copy";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixBoolBranching(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Look for pattern: "if (EXPR) return true; else return false;"
+  // or "if (EXPR) return true;\n  else return false;"
+  // or "if (EXPR) return true;\nreturn false;"
+  size_t IfPos = Snippet.find("if");
+  if (IfPos == StringRef::npos)
+    return {};
+
+  size_t ParenOpen = Snippet.find('(', IfPos);
+  if (ParenOpen == StringRef::npos)
+    return {};
+
+  // Find matching ')'.
+  unsigned Depth = 0;
+  size_t ParenClose = StringRef::npos;
+  for (size_t I = ParenOpen; I < Snippet.size(); ++I) {
+    if (Snippet[I] == '(')
+      ++Depth;
+    else if (Snippet[I] == ')') {
+      --Depth;
+      if (Depth == 0) {
+        ParenClose = I;
+        break;
+      }
+    }
+  }
+  if (ParenClose == StringRef::npos)
+    return {};
+
+  // Extract the condition expression.
+  StringRef Cond = Snippet.substr(ParenOpen + 1, ParenClose - ParenOpen - 1).trim();
+  if (Cond.empty())
+    return {};
+
+  // Check for "return true" after the condition.
+  StringRef AfterCond = Snippet.substr(ParenClose + 1);
+  StringRef Trimmed = AfterCond.ltrim();
+
+  // Handle both braced and non-braced forms.
+  bool HasReturnTrue = false;
+  if (Trimmed.starts_with("return true;"))
+    HasReturnTrue = true;
+  else if (Trimmed.starts_with("{")) {
+    StringRef InBrace = Trimmed.substr(1).ltrim();
+    if (InBrace.starts_with("return true;"))
+      HasReturnTrue = true;
+  }
+  if (!HasReturnTrue)
+    return {};
+
+  // Check for "return false" after that.
+  size_t RetFalsePos = AfterCond.find("return false;");
+  if (RetFalsePos == StringRef::npos)
+    return {};
+
+  // Find the end of the entire if/else construct.
+  size_t EndPos = AfterCond.find("return false;") + strlen("return false;");
+  // Account for closing brace if present.
+  StringRef AfterRetFalse = AfterCond.substr(EndPos).ltrim();
+  if (AfterRetFalse.starts_with("}"))
+    EndPos += (AfterRetFalse.data() - AfterCond.substr(EndPos).data()) + 1;
+
+  // Total extent from "if" to end.
+  size_t TotalLen = (ParenClose + 1 - IfPos) + EndPos;
+  std::string OldText = Snippet.substr(IfPos, TotalLen).str();
+  std::string NewText = ("return " + Cond + ";").str();
+
+  AutoFix Fix;
+  Fix.Loc = Loc.getLocWithOffset(IfPos);
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = OldText;
+  Fix.NewText = NewText;
+  Fix.Description = "simplify bool branching to direct return";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixPowerOfTwo(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Look for "x % N" or "x / N" where N is a literal power of 2.
+  // Find '%' or '/' operator.
+  size_t ModPos = Snippet.find('%');
+  size_t DivPos = Snippet.find('/');
+
+  // Skip "//", "/=" etc.
+  if (DivPos != StringRef::npos && DivPos + 1 < Snippet.size()) {
+    char Next = Snippet[DivPos + 1];
+    if (Next == '/' || Next == '*' || Next == '=')
+      DivPos = StringRef::npos;
+  }
+
+  size_t OpPos = StringRef::npos;
+  bool IsMod = false;
+  if (ModPos != StringRef::npos && DivPos != StringRef::npos) {
+    if (ModPos < DivPos) {
+      OpPos = ModPos;
+      IsMod = true;
+    } else {
+      OpPos = DivPos;
+    }
+  } else if (ModPos != StringRef::npos) {
+    OpPos = ModPos;
+    IsMod = true;
+  } else if (DivPos != StringRef::npos) {
+    OpPos = DivPos;
+  }
+
+  if (OpPos == StringRef::npos)
+    return {};
+
+  // Extract LHS (variable before operator).
+  StringRef LHS = Snippet.substr(0, OpPos).rtrim();
+  if (LHS.empty())
+    return {};
+  // Get the rightmost token as the variable.
+  size_t LHSStart = LHS.size();
+  while (LHSStart > 0 && (isalnum(LHS[LHSStart - 1]) || LHS[LHSStart - 1] == '_'))
+    --LHSStart;
+  StringRef Var = LHS.substr(LHSStart);
+  if (Var.empty())
+    return {};
+
+  // Extract RHS (number after operator).
+  StringRef RHS = Snippet.substr(OpPos + 1).ltrim();
+  // Read digits.
+  size_t NumEnd = 0;
+  while (NumEnd < RHS.size() && std::isdigit(RHS[NumEnd]))
+    ++NumEnd;
+  if (NumEnd == 0)
+    return {};
+  StringRef NumStr = RHS.substr(0, NumEnd);
+
+  // Parse the number and check if it's a power of 2.
+  unsigned long long N = 0;
+  if (NumStr.getAsInteger(10, N) || N == 0)
+    return {};
+  if ((N & (N - 1)) != 0)
+    return {}; // Not a power of 2.
+
+  // Compute log2.
+  unsigned Log2N = 0;
+  {
+    unsigned long long Tmp = N;
+    while (Tmp > 1) {
+      Tmp >>= 1;
+      ++Log2N;
+    }
+  }
+
+  // Build the old and new text.
+  // Old: "var % N" or "var / N" (with surrounding whitespace as found).
+  std::string OldExpr = Snippet.substr(LHSStart, (OpPos + 1 + NumEnd) - LHSStart).str();
+  // Trim to actual expression extent.
+  StringRef OldExprRef(OldExpr);
+
+  std::string NewExpr;
+  if (IsMod) {
+    NewExpr = ("(" + Var + " & " + std::to_string(N - 1) + ")").str();
+  } else {
+    NewExpr = ("(" + Var + " >> " + std::to_string(Log2N) + ")").str();
+  }
+
+  AutoFix Fix;
+  Fix.Loc = Loc.getLocWithOffset(LHSStart);
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = OldExpr;
+  Fix.NewText = NewExpr;
+  Fix.Description = IsMod ? "replace modulo with bitwise AND for power-of-2"
+                          : "replace division with right shift for power-of-2";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixSoAComment(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: restructure to SoA"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent;
+  if (Col > 1)
+    Indent.assign(Col - 1, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: restructure to SoA for vectorization\n";
+  Fix.Description = "suggest SoA restructuring for better vectorization";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixVectorizePragma(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("vectorize(enable)") ||
+      Snippet.contains("vectorize(assume_safety)"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent;
+  if (Col > 1)
+    Indent.assign(Col - 1, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "#pragma clang loop vectorize(enable)\n";
+  Fix.Description = "add vectorization pragma before loop";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixExceptionComment(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: move try/catch outside"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent;
+  if (Col > 1)
+    Indent.assign(Col - 1, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: move try/catch outside this loop\n";
+  Fix.Description = "suggest moving exception handling outside loop";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixMutexComment(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: move lock outside loop"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent;
+  if (Col > 1)
+    Indent.assign(Col - 1, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: move lock outside loop, or use lock-free\n";
+  Fix.Description = "suggest moving mutex lock outside loop";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixStdFunctionComment(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: use template param"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent;
+  if (Col > 1)
+    Indent.assign(Col - 1, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: use template param instead of std::function\n";
+  Fix.Description = "suggest template parameter instead of std::function";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixLoopBound(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Find the for loop structure.
+  size_t ForPos = Snippet.find("for");
+  if (ForPos == StringRef::npos)
+    return {};
+
+  size_t ParenOpen = Snippet.find('(', ForPos);
+  if (ParenOpen == StringRef::npos)
+    return {};
+
+  // Find the condition (between first and second semicolons).
+  size_t FirstSemi = Snippet.find(';', ParenOpen);
+  if (FirstSemi == StringRef::npos)
+    return {};
+
+  size_t SecondSemi = Snippet.find(';', FirstSemi + 1);
+  if (SecondSemi == StringRef::npos)
+    return {};
+
+  StringRef Condition =
+      Snippet.substr(FirstSemi + 1, SecondSemi - FirstSemi - 1).trim();
+
+  // Extract the bound variable (RHS of '<' or '<=').
+  size_t LtPos = Condition.find('<');
+  if (LtPos == StringRef::npos)
+    return {};
+
+  StringRef Bound = Condition.substr(LtPos + 1).ltrim();
+  if (Bound.starts_with("="))
+    Bound = Bound.substr(1).ltrim();
+  Bound = Bound.trim();
+  if (Bound.empty())
+    return {};
+
+  // Only handle simple variable names (not expressions or literals).
+  for (char C : Bound) {
+    if (!isalnum(C) && C != '_')
+      return {};
+  }
+
+  // Skip if it's already a literal number (not useful to add assume).
+  if (!Bound.empty() && std::isdigit(Bound[0]))
+    return {};
+
+  // Check if __builtin_assume is already present nearby.
+  if (Snippet.contains("__builtin_assume"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent;
+  if (Col > 1)
+    Indent.assign(Col - 1, ' ');
+
+  std::string AssumeLine = Indent + "__builtin_assume(" + Bound.str() +
+                            " > 0 && " + Bound.str() + " <= 1024);\n";
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = AssumeLine;
+  Fix.Description = "add __builtin_assume to help loop bound analysis";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixLambdaCapture(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Find "[=]" at or near SrcLoc.
+  SourceLocation EqCapLoc = findTextAfter(Loc, "[=]", 256, SM, LO);
+  if (EqCapLoc.isInvalid())
+    return {};
+
+  // Already [&]?
+  if (Snippet.contains("[&]"))
+    return {};
+
+  AutoFix Fix;
+  Fix.Loc = EqCapLoc;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = "[=]";
+  Fix.NewText = "[&]";
+  Fix.Description = "change lambda capture from by-value to by-reference";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixTightAllocComment(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: hoist allocation outside loop"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent;
+  if (Col > 1)
+    Indent.assign(Col - 1, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: hoist allocation outside loop\n";
+  Fix.Description = "suggest hoisting allocation outside tight loop";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixRedundantComputComment(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: hoist invariant computation outside loop"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent;
+  if (Col > 1)
+    Indent.assign(Col - 1, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: hoist invariant computation outside loop\n";
+  Fix.Description = "suggest hoisting invariant computation outside loop";
   return {Fix};
 }
 
