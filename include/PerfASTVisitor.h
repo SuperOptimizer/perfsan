@@ -122,17 +122,30 @@ private:
                                       const clang::VarDecl *>> &Results);
 };
 
+/// Output mode for the plugin.
+enum class PerfOutputMode {
+  Report,  // Default: print sorted report to stderr
+  Fix,     // Apply fixes in-place
+  Diff,    // Print unified diff of proposed changes
+  Diag,    // Emit as clang diagnostics with FixItHints
+  Quiet,   // Only count hints
+};
+
 class PerfASTConsumer : public clang::ASTConsumer {
 public:
   explicit PerfASTConsumer(clang::CompilerInstance &CI,
-                           PerfHintCollector &Collector)
-      : CI(CI), Collector(Collector) {}
+                           PerfHintCollector &Collector,
+                           PerfOutputMode Mode = PerfOutputMode::Report,
+                           unsigned MinScore = 0)
+      : CI(CI), Collector(Collector), Mode(Mode), MinScore(MinScore) {}
 
   void HandleTranslationUnit(clang::ASTContext &Ctx) override;
 
 private:
   clang::CompilerInstance &CI;
   PerfHintCollector &Collector;
+  PerfOutputMode Mode;
+  unsigned MinScore;
 };
 
 } // namespace perfsanitizer

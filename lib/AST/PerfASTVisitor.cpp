@@ -1,6 +1,8 @@
 //===- PerfASTVisitor.cpp - AST-level performance hint detection ----------===//
 
 #include "PerfASTVisitor.h"
+#include "PerfAutoFix.h"
+#include "PerfFixItEmitter.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -1574,9 +1576,72 @@ void PerfASTConsumer::HandleTranslationUnit(ASTContext &Ctx) {
   PerfASTVisitor Visitor(Ctx, Collector);
   Visitor.TraverseDecl(Ctx.getTranslationUnitDecl());
 
-  // Emit report after AST analysis completes.
-  if (!Collector.empty()) {
-    Collector.finalize();
+  if (Collector.empty())
+    return;
+  Collector.finalize();
+
+  // Filter by minimum score
+  if (MinScore > 0) {
+    auto &Hints = const_cast<std::vector<PerfHint> &>(Collector.getHints());
+    Hints.erase(
+        std::remove_if(Hints.begin(), Hints.end(),
+                       [this](const PerfHint &H) { return H.Score < MinScore; }),
+        Hints.end());
+  }
+
+  auto &SM = CI.getSourceManager();
+
+  switch (Mode) {
+  case PerfOutputMode::Report:
     Collector.emitToStream(llvm::errs());
+    break;
+
+  case PerfOutputMode::Fix: {
+    PerfAutoFixer Fixer(SM, CI.getLangOpts());
+    unsigned Applied = 0;
+    for (const auto &H : Collector.getHints()) {
+      auto Fixes = Fixer.generateFixes(H, Ctx);
+      if (!Fixes.empty()) {
+        Fixer.applyFixes(Fixes);
+        ++Applied;
+      }
+    }
+    if (Applied > 0) {
+      Fixer.writeFixedFiles();
+      llvm::errs() << "perfsanitizer: applied " << Applied << " auto-fixes ("
+                    << Collector.size() << " total hints)\n";
+    } else {
+      llvm::errs() << "perfsanitizer: no fixable hints found ("
+                    << Collector.size() << " total hints)\n";
+    }
+    break;
+  }
+
+  case PerfOutputMode::Diff: {
+    PerfAutoFixer Fixer(SM, CI.getLangOpts());
+    unsigned Fixable = 0;
+    for (const auto &H : Collector.getHints()) {
+      auto Fixes = Fixer.generateFixes(H, Ctx);
+      if (!Fixes.empty()) {
+        Fixer.applyFixes(Fixes);
+        ++Fixable;
+      }
+    }
+    std::string D = Fixer.getDiff();
+    if (!D.empty()) {
+      llvm::outs() << D;
+    }
+    llvm::errs() << "perfsanitizer: " << Fixable << " fixable / "
+                  << Collector.size() << " total hints\n";
+    break;
+  }
+
+  case PerfOutputMode::Diag:
+    emitAllHintsAsDiagnostics(CI.getDiagnostics(), SM, Collector);
+    break;
+
+  case PerfOutputMode::Quiet:
+    llvm::errs() << "perfsanitizer: " << Collector.size() << " hints\n";
+    break;
   }
 }

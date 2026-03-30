@@ -10,6 +10,7 @@
 
 #pragma once
 #include "PerfHint.h"
+#include "clang/AST/ASTContext.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Rewrite/Core/Rewriter.h"
 #include <string>

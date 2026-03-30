@@ -1,14 +1,20 @@
 //===- Plugin.cpp - PerfSanitizer plugin registration ---------------------===//
 //
 // Registers both the Clang frontend plugin (AST analysis) and the LLVM
-// pass plugin (IR analysis). When loaded, hints from both layers are
-// collected, deduplicated, sorted by impact score, and emitted.
+// pass plugin (IR analysis). Supports fix/diff/diag/quiet modes.
+//
+// Usage:
+//   clang++ -fplugin=PerfSanitizer.so -O2 -c file.cpp          # report mode
+//   clang++ -fplugin=PerfSanitizer.so -Xclang -plugin-arg-perf-sanitizer -Xclang fix -O2 -c file.cpp    # auto-fix
+//   clang++ -fplugin=PerfSanitizer.so -Xclang -plugin-arg-perf-sanitizer -Xclang diff -O2 -c file.cpp   # show diff
+//   clang++ -fplugin=PerfSanitizer.so -Xclang -plugin-arg-perf-sanitizer -Xclang quiet -O2 -c file.cpp  # count only
 //
 //===----------------------------------------------------------------------===//
 
 #include "PerfASTVisitor.h"
 #include "PerfHint.h"
 #include "PerfIRPass.h"
+#include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -21,15 +27,31 @@ using namespace perfsanitizer;
 namespace {
 
 class PerfSanitizerAction : public clang::PluginASTAction {
+  PerfOutputMode Mode = PerfOutputMode::Report;
+  unsigned MinScore = 0;
+
 public:
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &CI, llvm::StringRef) override {
     return std::make_unique<PerfASTConsumer>(CI,
-                                             PerfHintCollector::instance());
+                                             PerfHintCollector::instance(),
+                                             Mode, MinScore);
   }
 
   bool ParseArgs(const clang::CompilerInstance &CI,
                  const std::vector<std::string> &Args) override {
+    for (const auto &Arg : Args) {
+      if (Arg == "fix")
+        Mode = PerfOutputMode::Fix;
+      else if (Arg == "diff")
+        Mode = PerfOutputMode::Diff;
+      else if (Arg == "diag")
+        Mode = PerfOutputMode::Diag;
+      else if (Arg == "quiet")
+        Mode = PerfOutputMode::Quiet;
+      else if (Arg.size() > 10 && Arg.substr(0, 10) == "min-score=")
+        MinScore = std::stoi(Arg.substr(10));
+    }
     return true;
   }
 

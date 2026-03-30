@@ -33,6 +33,8 @@ add_llvm_library(PerfSanitizer MODULE
   lib/PerfHint.cpp
   lib/AST/PerfASTVisitor.cpp
   lib/AST/PerfASTExtraChecks.cpp
+  lib/AST/PerfFixItEmitter.cpp
+  lib/PerfAutoFix.cpp
   lib/IR/PerfIRPass.cpp
   lib/Plugin.cpp
 
@@ -41,8 +43,8 @@ add_llvm_library(PerfSanitizer MODULE
 
 target_include_directories(PerfSanitizer PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/AST
 )
 
 # No target_link_libraries for LLVM/Clang — symbols resolved at load time
-# from the host clang/opt binary. On Linux, undefined symbols in MODULE
-# libraries are resolved from the loading executable.
+# from the host clang/opt binary.

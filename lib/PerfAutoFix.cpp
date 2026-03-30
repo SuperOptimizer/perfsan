@@ -12,6 +12,8 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Rewrite/Core/Rewriter.h"
+#include "llvm/ADT/RewriteBuffer.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include <string>
@@ -163,7 +165,7 @@ std::string PerfAutoFixer::getDiff() {
   for (auto It = Rewrite.buffer_begin(), End = Rewrite.buffer_end();
        It != End; ++It) {
     FileID FID = It->first;
-    const RewriteBuffer &RB = It->second;
+    const llvm::RewriteBuffer &RB = It->second;
 
     OptionalFileEntryRef Entry = SM.getFileEntryRefForID(FID);
     StringRef FileName = Entry ? Entry->getName() : "<unknown>";
