@@ -142,6 +142,93 @@ static SourceLocation findLocAfterText(SourceLocation Loc, StringRef Needle,
 }
 
 //===----------------------------------------------------------------------===//
+// Standalone fix helpers (no header declaration needed)
+//===----------------------------------------------------------------------===//
+
+/// Fix CopyInRangeFor: change `for (auto ` to `for (const auto& `.
+static std::vector<AutoFix>
+fixCopyInRangeForStatic(const PerfHint &H, ASTContext &Ctx,
+                        SourceManager &SM) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Must look like a range-for with "auto".
+  size_t ForPos = Snippet.find("for");
+  if (ForPos == StringRef::npos)
+    return {};
+
+  // Find "auto" after "for".
+  size_t AutoPos = Snippet.find("auto", ForPos);
+  if (AutoPos == StringRef::npos)
+    return {};
+
+  // Check what comes before "auto" (skip whitespace).
+  StringRef BeforeAuto = Snippet.substr(ForPos, AutoPos - ForPos);
+
+  // Already has const or reference — bail.
+  if (BeforeAuto.contains("const"))
+    return {};
+
+  // Check what comes after "auto" — if already "auto&" or "auto &", bail.
+  StringRef AfterAuto = Snippet.substr(AutoPos + 4).ltrim();
+  if (!AfterAuto.empty() && (AfterAuto[0] == '&' || AfterAuto[0] == '*'))
+    return {};
+
+  // Insert "const " before "auto" and "& " after "auto".
+  SourceLocation AutoLoc = Loc.getLocWithOffset(AutoPos);
+  SourceLocation AfterAutoLoc = Loc.getLocWithOffset(AutoPos + 4);
+
+  AutoFix Fix1;
+  Fix1.Loc = AutoLoc;
+  Fix1.FixKind = AutoFix::Insert;
+  Fix1.NewText = "const ";
+  Fix1.Description = "add const to range-for variable";
+
+  AutoFix Fix2;
+  Fix2.Loc = AfterAutoLoc;
+  Fix2.FixKind = AutoFix::Insert;
+  Fix2.NewText = "& ";
+  Fix2.Description = "add reference to range-for variable";
+
+  return {Fix1, Fix2};
+}
+
+/// Fix VirtualDtorMissing: insert `virtual ` before `~ClassName`.
+static std::vector<AutoFix>
+fixVirtualDtorMissingStatic(const PerfHint &H, ASTContext &Ctx,
+                            SourceManager &SM) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Find the destructor '~'.
+  size_t TildePos = Snippet.find('~');
+  if (TildePos == StringRef::npos)
+    return {};
+
+  // Already virtual?
+  StringRef BeforeTilde = Snippet.substr(0, TildePos);
+  if (BeforeTilde.contains("virtual"))
+    return {};
+
+  SourceLocation TildeLoc = Loc.getLocWithOffset(TildePos);
+
+  AutoFix Fix;
+  Fix.Loc = TildeLoc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = "virtual ";
+  Fix.Description = "add virtual to destructor";
+  return {Fix};
+}
+
+//===----------------------------------------------------------------------===//
 // PerfAutoFixer
 //===----------------------------------------------------------------------===//
 
@@ -248,11 +335,36 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
   case HintCategory::SortAlgorithm:
   case HintCategory::BitManipulation:
   case HintCategory::RedundantAtomic:
-  case HintCategory::CacheLineSplit:
   case HintCategory::CrossTUInlining:
     return {}; // Report-only — suggestions emitted to stderr
+  case HintCategory::CacheLineSplit:
+    return fixCacheLineSplit(Hint, Ctx);
   case HintCategory::HotColdFunction:
     return fixHotColdFunc(Hint, Ctx);
+  // Fixable new categories:
+  case HintCategory::CopyInRangeFor:
+    return fixCopyInRangeForStatic(Hint, Ctx, SM);
+  case HintCategory::VirtualDtorMissing:
+    return fixVirtualDtorMissingStatic(Hint, Ctx, SM);
+  case HintCategory::SmallFunctionInline:
+    return fixSmallFunctionInline(Hint, Ctx);
+  // Categories that need structural or semantic changes — report only:
+  case HintCategory::DivisionChain:
+  case HintCategory::BranchOnFloat:
+  case HintCategory::EmptyLoopBody:
+  case HintCategory::DuplicateCondition:
+  case HintCategory::StringConcatInLoop:
+  case HintCategory::RegexInLoop:
+  case HintCategory::DynamicCastInLoop:
+  case HintCategory::ThrowInNoexcept:
+  case HintCategory::GlobalVarInLoop:
+  case HintCategory::VolatileInLoop:
+  case HintCategory::ImplicitConversion:
+  case HintCategory::SlicingCopy:
+  case HintCategory::SpillPressure:
+  case HintCategory::UnrollingBlocker:
+  case HintCategory::MemoryAccessPattern:
+    return {};
   default:
     return {};
   }
