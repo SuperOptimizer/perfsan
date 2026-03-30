@@ -47,6 +47,15 @@ private:
   void checkSIMDWidth(llvm::Function &F, llvm::FunctionAnalysisManager &FAM);
   void checkStrengthReduction(llvm::Function &F,
                               llvm::FunctionAnalysisManager &FAM);
+  void checkBitManipulation(llvm::Function &F,
+                            llvm::FunctionAnalysisManager &FAM);
+  void checkRedundantAtomics(llvm::Function &F);
+  void checkCacheLineSplits(llvm::Function &F,
+                            llvm::FunctionAnalysisManager &FAM);
+  void checkCrossTUInlining(llvm::Function &F,
+                            llvm::FunctionAnalysisManager &FAM);
+  void checkHotColdFunction(llvm::Function &F,
+                            llvm::FunctionAnalysisManager &FAM);
 };
 
 } // namespace perfsanitizer

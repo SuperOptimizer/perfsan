@@ -32,6 +32,7 @@ add_definitions(${LLVM_DEFINITIONS_LIST})
 add_llvm_library(PerfSanitizer MODULE
   lib/PerfHint.cpp
   lib/AST/PerfASTVisitor.cpp
+  lib/AST/PerfASTExtraChecks.cpp
   lib/IR/PerfIRPass.cpp
   lib/Plugin.cpp
 

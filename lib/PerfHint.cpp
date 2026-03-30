@@ -68,6 +68,22 @@ const char *PerfHint::categoryName() const {
     return "missing-nodiscard";
   case HintCategory::SignedLoopCounter:
     return "signed-loop-counter";
+  case HintCategory::ExceptionCost:
+    return "exception-cost";
+  case HintCategory::FalseSharing:
+    return "false-sharing";
+  case HintCategory::StringByValue:
+    return "string-by-value";
+  case HintCategory::ContainerReserve:
+    return "container-reserve";
+  case HintCategory::RangeForConversion:
+    return "range-for-conversion";
+  case HintCategory::ConstexprIf:
+    return "constexpr-if";
+  case HintCategory::LambdaCaptureOpt:
+    return "lambda-capture-opt";
+  case HintCategory::OutputParamToReturn:
+    return "output-param-to-return";
   }
   return "unknown";
 }

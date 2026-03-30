@@ -138,6 +138,584 @@ bool PerfASTVisitor::referencesAnyVar(
 }
 
 // ---------------------------------------------------------------------------
+// Helper: check if a type's qualified name contains a substring
+// ---------------------------------------------------------------------------
+
+bool PerfASTVisitor::typeNameContains(QualType T, llvm::StringRef Substr) {
+  if (T.isNull())
+    return false;
+  // Check the canonical type's string representation.
+  std::string TypeStr = T.getCanonicalType().getAsString();
+  return TypeStr.find(Substr.str()) != std::string::npos;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: check if a statement subtree contains a CXXTryStmt
+// ---------------------------------------------------------------------------
+
+bool PerfASTVisitor::containsTryCatch(const Stmt *S) {
+  if (!S)
+    return false;
+  if (isa<CXXTryStmt>(S))
+    return true;
+  for (const Stmt *Child : S->children()) {
+    if (containsTryCatch(Child))
+      return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: check if a function body calls .reserve() on a given VarDecl
+// ---------------------------------------------------------------------------
+
+bool PerfASTVisitor::hasReserveCallFor(const Stmt *Body,
+                                       const VarDecl *VD) {
+  if (!Body || !VD)
+    return false;
+  // Walk the entire body looking for calls to .reserve() on VD.
+  std::function<bool(const Stmt *)> Search = [&](const Stmt *S) -> bool {
+    if (!S)
+      return false;
+    if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(S)) {
+      if (const auto *Callee = MCE->getMethodDecl()) {
+        if (Callee->getNameAsString() == "reserve") {
+          // Check if the object is our variable.
+          const Expr *Obj = MCE->getImplicitObjectArgument();
+          if (Obj) {
+            Obj = Obj->IgnoreParenImpCasts();
+            if (const auto *DRE = dyn_cast<DeclRefExpr>(Obj)) {
+              if (DRE->getDecl() == VD)
+                return true;
+            }
+          }
+        }
+      }
+    }
+    for (const Stmt *Child : S->children()) {
+      if (Search(Child))
+        return true;
+    }
+    return false;
+  };
+  return Search(Body);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: find push_back/emplace_back calls on vector variables in a subtree
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::findPushBackCalls(
+    const Stmt *S,
+    llvm::SmallVectorImpl<
+        std::pair<const CXXMemberCallExpr *, const VarDecl *>> &Results) {
+  if (!S)
+    return;
+  if (const auto *MCE = dyn_cast<CXXMemberCallExpr>(S)) {
+    if (const auto *Callee = MCE->getMethodDecl()) {
+      StringRef Name = Callee->getName();
+      if (Name == "push_back" || Name == "emplace_back") {
+        // Check if the object type is a vector.
+        const Expr *Obj = MCE->getImplicitObjectArgument();
+        if (Obj) {
+          QualType ObjT = Obj->getType();
+          if (typeNameContains(ObjT, "vector")) {
+            const Expr *ObjClean = Obj->IgnoreParenImpCasts();
+            if (const auto *DRE = dyn_cast<DeclRefExpr>(ObjClean)) {
+              if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+                Results.push_back({MCE, VD});
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  for (const Stmt *Child : S->children())
+    findPushBackCalls(Child, Results);
+}
+
+// ---------------------------------------------------------------------------
+// ExceptionCost — try/catch inside loops
+// ---------------------------------------------------------------------------
+
+bool PerfASTVisitor::VisitCXXTryStmt(CXXTryStmt *S) {
+  if (SM.isInSystemHeader(S->getBeginLoc()))
+    return true;
+
+  if (CurrentLoopDepth > 0) {
+    Collector.addHint(makeHint(
+        HintCategory::ExceptionCost, Impact::High, S->getBeginLoc(),
+        "try/catch block inside a loop (depth " +
+            std::to_string(CurrentLoopDepth) +
+            ") — exception handling setup adds overhead every iteration.",
+        "Move the try/catch outside the loop, use noexcept on hot-path "
+        "functions, or switch to error codes for performance-critical loops."));
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// FalseSharing — adjacent atomic/volatile fields in a record
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkFalseSharing(CXXRecordDecl *RD) {
+  // Collect fields that are atomic or volatile.
+  struct FieldInfo {
+    FieldDecl *Field;
+    uint64_t OffsetBits;
+    uint64_t SizeBits;
+    bool IsAtomicOrVolatile;
+  };
+
+  const auto &Layout = Ctx.getASTRecordLayout(RD);
+  llvm::SmallVector<FieldInfo, 16> Fields;
+  unsigned Idx = 0;
+  for (auto *Field : RD->fields()) {
+    QualType T = Field->getType();
+    bool IsAV = T.isVolatileQualified() || typeNameContains(T, "atomic");
+    uint64_t Offset = Layout.getFieldOffset(Idx);
+    uint64_t Size = Ctx.getTypeSize(T);
+    Fields.push_back({Field, Offset, Size, IsAV});
+    ++Idx;
+  }
+
+  // Look for pairs of adjacent atomic/volatile fields that could be on
+  // different cache lines when accessed by different threads.
+  const uint64_t CacheLineBits = 64 * 8; // 64 bytes = 512 bits
+  for (size_t I = 0; I + 1 < Fields.size(); ++I) {
+    if (!Fields[I].IsAtomicOrVolatile || !Fields[I + 1].IsAtomicOrVolatile)
+      continue;
+
+    // Check if they fit together in less than 64 bytes.
+    uint64_t CombinedBits =
+        (Fields[I + 1].OffsetBits + Fields[I + 1].SizeBits) -
+        Fields[I].OffsetBits;
+    if (CombinedBits >= CacheLineBits)
+      continue; // Already too big, not our concern.
+
+    // They are close together — potential false sharing.
+    Collector.addHint(makeHint(
+        HintCategory::FalseSharing, Impact::Medium, Fields[I].Field->getLocation(),
+        "Adjacent atomic/volatile fields '" +
+            Fields[I].Field->getNameAsString() + "' and '" +
+            Fields[I + 1].Field->getNameAsString() +
+            "' may cause false sharing — they share a cache line but may "
+            "be accessed by different threads.",
+        "Add alignas(64) padding between these fields, or use "
+        "alignas(std::hardware_destructive_interference_size) to ensure "
+        "each field occupies its own cache line."));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// StringByValue — detect std::string passed by value
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkStringByValue(FunctionDecl *FD) {
+  for (const auto *Param : FD->parameters()) {
+    QualType T = Param->getType();
+    // Skip references, pointers, and r-value references.
+    if (T->isReferenceType() || T->isPointerType())
+      continue;
+    // Check if it's a std::string (basic_string).
+    if (typeNameContains(T, "basic_string")) {
+      Collector.addHint(makeHint(
+          HintCategory::StringByValue, Impact::Medium, Param->getLocation(),
+          "Parameter '" + Param->getNameAsString() +
+              "' passes std::string by value — involves a heap allocation "
+              "and copy on every call.",
+          "Use 'const std::string&' or 'std::string_view' instead to "
+          "avoid the copy."));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ContainerReserve — push_back/emplace_back without reserve() in loops
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkContainerReserve(Stmt *LoopBody,
+                                           SourceLocation Loc) {
+  if (!LoopBody)
+    return;
+
+  llvm::SmallVector<std::pair<const CXXMemberCallExpr *, const VarDecl *>, 8>
+      PushCalls;
+  findPushBackCalls(LoopBody, PushCalls);
+
+  // For each push_back/emplace_back, check if there's a .reserve() call
+  // on the same variable in the enclosing function body.
+  // We walk up via the parent map to find the function body.
+  for (const auto &[MCE, VD] : PushCalls) {
+    // Walk parents to find the enclosing FunctionDecl.
+    const Stmt *Current = LoopBody;
+    const FunctionDecl *EnclosingFD = nullptr;
+    // Use a simpler approach: walk parents of the loop body.
+    auto Parents = Ctx.getParents(*MCE);
+    const Stmt *Walk = LoopBody;
+    // Try to find enclosing function by walking parent map from the MCE.
+    auto WalkParents = Ctx.getParents(
+        *static_cast<const Stmt *>(LoopBody));
+    // Simplified: just check if VD has reserve() anywhere in the
+    // translation unit is too broad. Instead check the loop body itself
+    // doesn't have reserve and flag it.
+    // A practical heuristic: if there's no reserve in the loop body's
+    // enclosing compound statement, flag it.
+
+    // Walk up parents to find the enclosing function body.
+    const Stmt *FuncBody = nullptr;
+    {
+      clang::DynTypedNodeList Pars = Ctx.getParents(*LoopBody);
+      for (int Depth = 0; Depth < 20 && !Pars.empty(); ++Depth) {
+        if (const auto *FDecl = Pars[0].get<FunctionDecl>()) {
+          FuncBody = FDecl->getBody();
+          break;
+        }
+        Pars = Ctx.getParents(Pars[0]);
+      }
+    }
+
+    if (!FuncBody || !hasReserveCallFor(FuncBody, VD)) {
+      const CXXMethodDecl *Method = MCE->getMethodDecl();
+      Collector.addHint(makeHint(
+          HintCategory::ContainerReserve, Impact::Medium, MCE->getBeginLoc(),
+          "'" + Method->getNameAsString() +
+              "' called on vector '" + VD->getNameAsString() +
+              "' inside a loop without a preceding .reserve() call.",
+          "Call .reserve() before the loop with the expected number of "
+          "elements to avoid repeated reallocations."));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// RangeForConversion — index-based for convertible to range-for
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkRangeForConversion(ForStmt *S) {
+  // Pattern: for (int/size_t i = 0; i < container.size(); i++)
+  //   ... container[i] ...
+
+  // Check init: must be a single VarDecl initialized to 0.
+  const Stmt *Init = S->getInit();
+  if (!Init)
+    return;
+  const VarDecl *IndexVar = nullptr;
+  if (const auto *DS = dyn_cast<DeclStmt>(Init)) {
+    if (DS->isSingleDecl()) {
+      if (const auto *VD = dyn_cast<VarDecl>(DS->getSingleDecl())) {
+        if (VD->hasInit()) {
+          if (const auto *IL = dyn_cast<IntegerLiteral>(
+                  VD->getInit()->IgnoreParenImpCasts())) {
+            if (IL->getValue() == 0)
+              IndexVar = VD;
+          }
+        }
+      }
+    }
+  }
+  if (!IndexVar)
+    return;
+
+  // Check cond: i < container.size()
+  const Expr *Cond = S->getCond();
+  if (!Cond)
+    return;
+  const BinaryOperator *BO = dyn_cast<BinaryOperator>(Cond);
+  if (!BO || (BO->getOpcode() != BO_LT && BO->getOpcode() != BO_NE))
+    return;
+
+  // LHS should reference IndexVar.
+  const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
+  const auto *LHSRef = dyn_cast<DeclRefExpr>(LHS);
+  if (!LHSRef || LHSRef->getDecl() != IndexVar)
+    return;
+
+  // RHS should be a .size() call.
+  const Expr *RHS = BO->getRHS()->IgnoreParenImpCasts();
+  const auto *SizeCall = dyn_cast<CXXMemberCallExpr>(RHS);
+  if (!SizeCall)
+    return;
+  const CXXMethodDecl *SizeMethod = SizeCall->getMethodDecl();
+  if (!SizeMethod || SizeMethod->getNameAsString() != "size")
+    return;
+
+  // Check inc: i++ or ++i.
+  const Stmt *Inc = S->getInc();
+  if (!Inc)
+    return;
+  bool IncOk = false;
+  if (const auto *UO = dyn_cast<UnaryOperator>(Inc)) {
+    if (UO->isIncrementOp()) {
+      if (const auto *DRE =
+              dyn_cast<DeclRefExpr>(UO->getSubExpr()->IgnoreParenImpCasts())) {
+        if (DRE->getDecl() == IndexVar)
+          IncOk = true;
+      }
+    }
+  }
+  if (!IncOk)
+    return;
+
+  // Check body uses container[i].
+  // This is a heuristic: look for ArraySubscriptExpr or operator[] calls
+  // with IndexVar.
+  bool UsesIndexAccess = false;
+  std::function<void(const Stmt *)> FindAccess = [&](const Stmt *St) {
+    if (!St || UsesIndexAccess)
+      return;
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(St)) {
+      if (const auto *Idx =
+              dyn_cast<DeclRefExpr>(ASE->getIdx()->IgnoreParenImpCasts())) {
+        if (Idx->getDecl() == IndexVar)
+          UsesIndexAccess = true;
+      }
+    }
+    if (const auto *OpCall = dyn_cast<CXXOperatorCallExpr>(St)) {
+      if (OpCall->getOperator() == OO_Subscript && OpCall->getNumArgs() >= 2) {
+        if (const auto *Idx = dyn_cast<DeclRefExpr>(
+                OpCall->getArg(1)->IgnoreParenImpCasts())) {
+          if (Idx->getDecl() == IndexVar)
+            UsesIndexAccess = true;
+        }
+      }
+    }
+    for (const Stmt *Child : St->children())
+      FindAccess(Child);
+  };
+  if (S->getBody())
+    FindAccess(S->getBody());
+
+  if (UsesIndexAccess) {
+    Collector.addHint(makeHint(
+        HintCategory::RangeForConversion, Impact::Low, S->getBeginLoc(),
+        "Index-based for-loop iterates over a container using .size() and "
+        "operator[] — could be a range-based for loop.",
+        "Use 'for (auto& elem : container)' for clearer intent, fewer "
+        "off-by-one risks, and potentially better optimization."));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ConstexprIf — if conditions that could be if constexpr
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkConstexprIf(IfStmt *S) {
+  if (S->isConstexpr())
+    return; // Already if constexpr.
+
+  const Expr *Cond = S->getCond();
+  if (!Cond)
+    return;
+
+  // Check if the condition involves sizeof, type traits (is_same, etc.).
+  bool CouldBeConstexpr = false;
+  std::string Reason;
+
+  std::function<void(const Expr *)> CheckExpr = [&](const Expr *E) {
+    if (!E || CouldBeConstexpr)
+      return;
+    E = E->IgnoreParenImpCasts();
+
+    // sizeof expressions.
+    if (isa<UnaryExprOrTypeTraitExpr>(E)) {
+      const auto *UETTE = cast<UnaryExprOrTypeTraitExpr>(E);
+      if (UETTE->getKind() == UETT_SizeOf) {
+        CouldBeConstexpr = true;
+        Reason = "sizeof";
+        return;
+      }
+    }
+
+    // Type trait calls like std::is_same<>::value or std::is_same_v<>.
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      StringRef Name = DRE->getDecl()->getName();
+      if (Name.contains("is_same") || Name.contains("is_integral") ||
+          Name.contains("is_floating") || Name.contains("is_pointer") ||
+          Name.contains("is_arithmetic") || Name.contains("is_enum") ||
+          Name.contains("is_class") || Name.contains("is_trivial") ||
+          Name.contains("is_base_of")) {
+        CouldBeConstexpr = true;
+        Reason = "type trait (" + Name.str() + ")";
+        return;
+      }
+    }
+
+    // Member expressions like std::is_same<...>::value.
+    if (const auto *ME = dyn_cast<MemberExpr>(E)) {
+      if (ME->getMemberDecl()->getName() == "value") {
+        // Check if the base type looks like a type trait.
+        QualType BaseT = ME->getBase()->getType();
+        std::string BaseName = BaseT.getAsString();
+        if (BaseName.find("is_same") != std::string::npos ||
+            BaseName.find("is_integral") != std::string::npos ||
+            BaseName.find("is_base_of") != std::string::npos ||
+            BaseName.find("is_trivial") != std::string::npos) {
+          CouldBeConstexpr = true;
+          Reason = "type trait";
+          return;
+        }
+      }
+    }
+
+    for (const Stmt *Child : E->children()) {
+      if (const auto *ChildE = dyn_cast_or_null<Expr>(Child))
+        CheckExpr(ChildE);
+    }
+  };
+
+  CheckExpr(Cond);
+
+  if (CouldBeConstexpr) {
+    Collector.addHint(makeHint(
+        HintCategory::ConstexprIf, Impact::Low, S->getBeginLoc(),
+        "If-condition uses " + Reason +
+            " which is known at compile time — the branch is always "
+            "taken or never taken.",
+        "Use 'if constexpr' to eliminate the dead branch at compile time, "
+        "reducing code size and enabling better optimization."));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LambdaCaptureOpt — large captures by value
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkLambdaCaptureOpt(LambdaExpr *LE) {
+  for (const auto &Cap : LE->captures()) {
+    if (Cap.getCaptureKind() != LCK_ByCopy)
+      continue;
+    const auto *CapturedVar = dyn_cast_or_null<VarDecl>(Cap.getCapturedVar());
+    if (!CapturedVar)
+      continue;
+
+    QualType T = CapturedVar->getType();
+    bool IsLarge = false;
+    std::string TypeDesc;
+
+    if (typeNameContains(T, "basic_string")) {
+      IsLarge = true;
+      TypeDesc = "std::string";
+    } else if (typeNameContains(T, "vector")) {
+      IsLarge = true;
+      TypeDesc = "std::vector";
+    } else if (T->isRecordType()) {
+      // Check struct/class size.
+      uint64_t Size = Ctx.getTypeSize(T) / 8;
+      if (Size > 64) { // More than 64 bytes.
+        IsLarge = true;
+        TypeDesc = "struct (" + std::to_string(Size) + " bytes)";
+      }
+    }
+
+    if (IsLarge) {
+      Collector.addHint(makeHint(
+          HintCategory::LambdaCaptureOpt, Impact::Medium,
+          Cap.getLocation(),
+          "Lambda captures '" + CapturedVar->getNameAsString() +
+              "' (" + TypeDesc + ") by value — this copies the entire object.",
+          "Capture by reference [&" + CapturedVar->getNameAsString() +
+              "] instead if the lambda does not outlive the captured variable, "
+              "or use [&] for all captures."));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OutputParamToReturn — pointer/ref out-params that could be return values
+// ---------------------------------------------------------------------------
+
+void PerfASTVisitor::checkOutputParamToReturn(FunctionDecl *FD) {
+  if (!FD->hasBody())
+    return;
+
+  // Only check void functions or functions returning simple types.
+  // Focus on non-const pointer/reference params.
+  for (const auto *Param : FD->parameters()) {
+    QualType T = Param->getType();
+    bool IsOutParam = false;
+
+    if (T->isPointerType()) {
+      QualType Pointee = T->getPointeeType();
+      if (!Pointee.isConstQualified())
+        IsOutParam = true;
+    } else if (T->isLValueReferenceType()) {
+      QualType Referent = T.getNonReferenceType();
+      if (!Referent.isConstQualified())
+        IsOutParam = true;
+    }
+
+    if (!IsOutParam)
+      continue;
+
+    // Check if the parameter is only written to, never read in the body.
+    // Heuristic: look for DeclRefExprs of this param.
+    const VarDecl *ParamVD = Param;
+    bool IsRead = false;
+    bool IsWritten = false;
+
+    std::function<void(const Stmt *)> Analyze = [&](const Stmt *S) {
+      if (!S)
+        return;
+      if (const auto *BO = dyn_cast<BinaryOperator>(S)) {
+        if (BO->isAssignmentOp()) {
+          // Check if LHS is our param (possibly dereferenced).
+          const Expr *LHS = BO->getLHS()->IgnoreParenImpCasts();
+          if (const auto *UO = dyn_cast<UnaryOperator>(LHS)) {
+            if (UO->getOpcode() == UO_Deref) {
+              if (const auto *DRE = dyn_cast<DeclRefExpr>(
+                      UO->getSubExpr()->IgnoreParenImpCasts())) {
+                if (DRE->getDecl() == ParamVD) {
+                  IsWritten = true;
+                  // Don't count this as a read. But check RHS for reads.
+                  // Recurse on RHS only.
+                  for (const Stmt *Child : BO->getRHS()->children())
+                    Analyze(Child);
+                  return;
+                }
+              }
+            }
+          }
+          if (const auto *DRE = dyn_cast<DeclRefExpr>(LHS)) {
+            if (DRE->getDecl() == ParamVD) {
+              IsWritten = true;
+              for (const Stmt *Child : BO->getRHS()->children())
+                Analyze(Child);
+              return;
+            }
+          }
+        }
+      }
+
+      // Any other reference to the param is a read.
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
+        if (DRE->getDecl() == ParamVD)
+          IsRead = true;
+      }
+
+      for (const Stmt *Child : S->children())
+        Analyze(Child);
+    };
+
+    Analyze(FD->getBody());
+
+    if (IsWritten && !IsRead) {
+      Collector.addHint(makeHint(
+          HintCategory::OutputParamToReturn, Impact::Low, Param->getLocation(),
+          "Parameter '" + Param->getNameAsString() +
+              "' is a non-const " +
+              (T->isPointerType() ? "pointer" : "reference") +
+              " that is only written to, never read — it is a pure output "
+              "parameter.",
+          "Return the value instead of using an output parameter. Modern "
+          "compilers apply NRVO/copy elision, making return-by-value "
+          "efficient."));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Cold path outlining — large blocks in error-handling branches
 // ---------------------------------------------------------------------------
 
@@ -536,6 +1114,12 @@ bool PerfASTVisitor::VisitFunctionDecl(FunctionDecl *FD) {
   // 5. Missing [[nodiscard]] check
   checkMissingNodiscard(FD);
 
+  // 6. String by value check
+  checkStringByValue(FD);
+
+  // 7. Output parameter to return value check
+  checkOutputParamToReturn(FD);
+
   return true;
 }
 
@@ -610,6 +1194,9 @@ bool PerfASTVisitor::VisitCXXRecordDecl(CXXRecordDecl *RD) {
           "improve cache utilization."));
     }
   }
+
+  // Check for false sharing among atomic/volatile fields.
+  checkFalseSharing(RD);
 
   return true;
 }
@@ -726,6 +1313,12 @@ bool PerfASTVisitor::VisitForStmt(ForStmt *S) {
     FindCalls(S->getCond());
   }
 
+  // Check for range-for conversion opportunity.
+  checkRangeForConversion(S);
+
+  // Check for push_back/emplace_back without reserve().
+  checkContainerReserve(S->getBody(), S->getBeginLoc());
+
   // After visiting children, decrement.
   // Note: RecursiveASTVisitor handles child traversal; we manage depth here.
   // We'll decrement in a post-order fashion via TraverseForStmt override
@@ -749,6 +1342,9 @@ bool PerfASTVisitor::VisitWhileStmt(WhileStmt *S) {
   // Check for loop unswitching opportunities
   checkLoopUnswitching(S, S->getBeginLoc());
 
+  // Check for push_back/emplace_back without reserve().
+  checkContainerReserve(S->getBody(), S->getBeginLoc());
+
   --CurrentLoopDepth;
   return true;
 }
@@ -760,6 +1356,9 @@ bool PerfASTVisitor::VisitWhileStmt(WhileStmt *S) {
 bool PerfASTVisitor::VisitIfStmt(IfStmt *S) {
   if (SM.isInSystemHeader(S->getBeginLoc()))
     return true;
+
+  // Check for if constexpr opportunities.
+  checkConstexprIf(S);
 
   // Suggest [[likely]]/[[unlikely]] for error-handling patterns
   // Check for cold path outlining opportunities (works with or without else)
@@ -952,6 +1551,18 @@ bool PerfASTVisitor::VisitDeclRefExpr(DeclRefExpr *DRE) {
   // This is a placeholder for move-semantics detection.
   // Full implementation would track last-use of variables in return
   // statements and suggest std::move.
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Lambda expressions — capture optimization
+// ---------------------------------------------------------------------------
+
+bool PerfASTVisitor::VisitLambdaExpr(LambdaExpr *LE) {
+  if (SM.isInSystemHeader(LE->getBeginLoc()))
+    return true;
+
+  checkLambdaCaptureOpt(LE);
   return true;
 }
 

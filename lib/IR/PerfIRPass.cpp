@@ -81,6 +81,11 @@ void PerfIRPass::analyzeFunction(Function &F, FunctionAnalysisManager &FAM) {
   checkSoAvsAoS(F, FAM);
   checkSIMDWidth(F, FAM);
   checkStrengthReduction(F, FAM);
+  checkBitManipulation(F, FAM);
+  checkRedundantAtomics(F);
+  checkCacheLineSplits(F, FAM);
+  checkCrossTUInlining(F, FAM);
+  checkHotColdFunction(F, FAM);
 }
 
 // ---------------------------------------------------------------------------
@@ -686,5 +691,487 @@ void PerfIRPass::checkStrengthReduction(Function &F,
         }
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bit manipulation patterns — manual popcount, ctz, clz
+// ---------------------------------------------------------------------------
+
+/// Check if a loop implements a manual popcount pattern:
+///   while (x) { count++; x &= (x - 1); }
+/// or the shift-and-mask variant:
+///   while (x) { count += x & 1; x >>= 1; }
+static bool isPopcountLoop(const Loop *L) {
+  // Must be a simple loop with a single latch.
+  BasicBlock *Latch = L->getLoopLatch();
+  BasicBlock *Header = L->getHeader();
+  if (!Latch || !Header)
+    return false;
+
+  // Look for the characteristic AND + SUB pattern: x &= (x - 1)
+  // or the shift-and-mask pattern: (x & 1) ... x >>= 1
+  bool HasAndSubPattern = false;
+  bool HasShiftMaskPattern = false;
+
+  for (BasicBlock *BB : L->blocks()) {
+    for (const Instruction &I : *BB) {
+      // Pattern 1: x & (x - 1)  — Brian Kernighan's trick
+      if (I.getOpcode() == Instruction::And) {
+        for (unsigned OpI = 0; OpI < 2; ++OpI) {
+          auto *Sub = dyn_cast<BinaryOperator>(I.getOperand(OpI));
+          if (Sub && Sub->getOpcode() == Instruction::Sub) {
+            if (auto *One = dyn_cast<ConstantInt>(Sub->getOperand(1))) {
+              if (One->isOne() && Sub->getOperand(0) == I.getOperand(1 - OpI))
+                HasAndSubPattern = true;
+            }
+          }
+        }
+      }
+
+      // Pattern 2: x & 1 followed by x >>= 1
+      if (I.getOpcode() == Instruction::And) {
+        if (auto *One = dyn_cast<ConstantInt>(I.getOperand(1))) {
+          if (One->isOne())
+            HasShiftMaskPattern = true;
+        }
+      }
+    }
+  }
+
+  // Also require a right shift for the shift-mask pattern.
+  if (HasShiftMaskPattern) {
+    bool HasRightShift = false;
+    for (BasicBlock *BB : L->blocks()) {
+      for (const Instruction &I : *BB) {
+        if (I.getOpcode() == Instruction::LShr ||
+            I.getOpcode() == Instruction::AShr) {
+          if (auto *Amt = dyn_cast<ConstantInt>(I.getOperand(1))) {
+            if (Amt->isOne())
+              HasRightShift = true;
+          }
+        }
+      }
+    }
+    if (!HasRightShift)
+      HasShiftMaskPattern = false;
+  }
+
+  return HasAndSubPattern || HasShiftMaskPattern;
+}
+
+/// Check if a loop implements counting leading/trailing zeros:
+///   while (x) { count++; x >>= 1; }  (leading zeros variant)
+///   while (x & 1 == 0) { count++; x >>= 1; } (trailing zeros)
+static bool isCountZerosLoop(const Loop *L, bool &IsTrailing) {
+  BasicBlock *Latch = L->getLoopLatch();
+  if (!Latch)
+    return false;
+
+  bool HasShift = false;
+  bool HasMaskTest = false;
+
+  for (BasicBlock *BB : L->blocks()) {
+    for (const Instruction &I : *BB) {
+      if (I.getOpcode() == Instruction::LShr ||
+          I.getOpcode() == Instruction::AShr) {
+        if (auto *Amt = dyn_cast<ConstantInt>(I.getOperand(1))) {
+          if (Amt->isOne())
+            HasShift = true;
+        }
+      }
+      // Check for (x & 1) == 0 test (trailing zero check)
+      if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
+        if (Cmp->getPredicate() == ICmpInst::ICMP_EQ ||
+            Cmp->getPredicate() == ICmpInst::ICMP_NE) {
+          for (unsigned OpI = 0; OpI < 2; ++OpI) {
+            if (auto *AndI =
+                    dyn_cast<BinaryOperator>(Cmp->getOperand(OpI))) {
+              if (AndI->getOpcode() == Instruction::And) {
+                if (auto *One = dyn_cast<ConstantInt>(AndI->getOperand(1))) {
+                  if (One->isOne())
+                    HasMaskTest = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!HasShift)
+    return false;
+
+  // Check if there's an increment (the count variable).
+  bool HasIncrement = false;
+  for (BasicBlock *BB : L->blocks()) {
+    for (const Instruction &I : *BB) {
+      if (I.getOpcode() == Instruction::Add) {
+        if (auto *One = dyn_cast<ConstantInt>(I.getOperand(1))) {
+          if (One->isOne())
+            HasIncrement = true;
+        }
+      }
+    }
+  }
+
+  if (!HasIncrement)
+    return false;
+
+  // If there's a mask test of bit 0, it's trailing; otherwise leading.
+  IsTrailing = HasMaskTest;
+  return true;
+}
+
+void PerfIRPass::checkBitManipulation(Function &F,
+                                      FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    unsigned Depth = L->getLoopDepth();
+    BasicBlock *Header = L->getHeader();
+    Instruction *Rep = Header && !Header->empty() ? &Header->front() : nullptr;
+
+    // Check for popcount loop pattern.
+    if (isPopcountLoop(L)) {
+      unsigned Score = scaleByLoopDepth(Impact::Medium, Depth);
+      // Placeholder: use StrengthReduction until BitManipulation enum is added
+      Collector.addHint(makeIRHint(
+          HintCategory::StrengthReduction, Score, Rep,
+          "Loop appears to implement a manual population count (popcount) "
+          "via bit manipulation.",
+          "Replace with __builtin_popcount() / __builtin_popcountll() which "
+          "maps to a single hardware instruction (POPCNT) on modern CPUs. "
+          "Compile with -mpopcnt or -march=native.",
+          F.getName()));
+      continue; // Don't also flag as count-zeros.
+    }
+
+    // Check for leading/trailing zero counting loops.
+    bool IsTrailing = false;
+    if (isCountZerosLoop(L, IsTrailing)) {
+      unsigned Score = scaleByLoopDepth(Impact::Medium, Depth);
+      std::string Builtin =
+          IsTrailing ? "__builtin_ctz() / __builtin_ctzll()"
+                     : "__builtin_clz() / __builtin_clzll()";
+      std::string Kind = IsTrailing ? "trailing" : "leading";
+      // Placeholder: use StrengthReduction until BitManipulation enum is added
+      Collector.addHint(makeIRHint(
+          HintCategory::StrengthReduction, Score, Rep,
+          "Loop appears to implement manual " + Kind +
+              " zero counting via shift and test.",
+          "Replace with " + Builtin +
+              " which maps to a single hardware instruction (BSF/BSR or "
+              "TZCNT/LZCNT) on modern CPUs.",
+          F.getName()));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Redundant atomics — sequential atomic ops on the same address
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkRedundantAtomics(Function &F) {
+  for (BasicBlock &BB : F) {
+    // Track the last atomic operation on each pointer within this BB.
+    // Key: pointer operand, Value: the last atomic instruction.
+    DenseMap<Value *, Instruction *> LastAtomicOnAddr;
+
+    for (Instruction &I : BB) {
+      Value *Ptr = nullptr;
+      bool IsAtomic = false;
+
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (LI->isAtomic()) {
+          Ptr = LI->getPointerOperand();
+          IsAtomic = true;
+        }
+      } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (SI->isAtomic()) {
+          Ptr = SI->getPointerOperand();
+          IsAtomic = true;
+        }
+      } else if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+        Ptr = RMW->getPointerOperand();
+        IsAtomic = true;
+      } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+        Ptr = CX->getPointerOperand();
+        IsAtomic = true;
+      }
+
+      if (!IsAtomic)
+        continue;
+
+      // Check if there's a previous atomic on the same address.
+      auto It = LastAtomicOnAddr.find(Ptr);
+      if (It != LastAtomicOnAddr.end()) {
+        // Found sequential atomics on the same address — check if there
+        // are any intervening atomics on OTHER addresses (which would act
+        // as a barrier and make this intentional).
+        bool InterveningOtherAtomic = false;
+        Instruction *Prev = It->second;
+        for (auto ChkIt = std::next(Prev->getIterator());
+             &*ChkIt != &I; ++ChkIt) {
+          bool ChkAtomic = false;
+          if (auto *ChkLd = dyn_cast<LoadInst>(&*ChkIt))
+            ChkAtomic = ChkLd->isAtomic();
+          else if (auto *ChkSt = dyn_cast<StoreInst>(&*ChkIt))
+            ChkAtomic = ChkSt->isAtomic();
+          else if (isa<AtomicRMWInst>(&*ChkIt) ||
+                   isa<AtomicCmpXchgInst>(&*ChkIt))
+            ChkAtomic = true;
+          else if (isa<FenceInst>(&*ChkIt))
+            ChkAtomic = true;
+
+          if (ChkAtomic) {
+            InterveningOtherAtomic = true;
+            break;
+          }
+        }
+
+        if (!InterveningOtherAtomic) {
+          unsigned Score = static_cast<unsigned>(Impact::High);
+          // Placeholder: use RedundantLoad until RedundantAtomic enum is added
+          Collector.addHint(makeIRHint(
+              HintCategory::RedundantLoad, Score, &I,
+              "Sequential atomic operations on the same address without "
+              "intervening atomic barriers — may indicate redundant "
+              "synchronization.",
+              "Consider batching atomic operations, combining into a single "
+              "atomic RMW, or relaxing memory ordering to "
+              "std::memory_order_relaxed if strict ordering is not required.",
+              F.getName()));
+        }
+      }
+
+      LastAtomicOnAddr[Ptr] = &I;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cache line split — struct fields spanning 64-byte boundary in loops
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkCacheLineSplits(Function &F,
+                                      FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  constexpr uint64_t CacheLineSize = 64;
+
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    unsigned Depth = L->getLoopDepth();
+
+    // Collect GEP accesses into struct types within this loop.
+    // Map: struct type -> set of (field index, field offset, field size).
+    struct FieldAccess {
+      unsigned FieldIdx;
+      uint64_t Offset;
+      uint64_t Size;
+      Instruction *Rep;
+    };
+    DenseMap<Type *, SmallVector<FieldAccess, 8>> StructAccesses;
+
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+        if (!GEP || GEP->getNumIndices() < 2)
+          continue;
+
+        Type *SrcTy = GEP->getSourceElementType();
+        auto *STy = dyn_cast<StructType>(SrcTy);
+        if (!STy)
+          continue;
+
+        // Get the struct field index (last constant index).
+        auto IdxIt = GEP->idx_end();
+        --IdxIt;
+        auto *FieldCI = dyn_cast<ConstantInt>(IdxIt->get());
+        if (!FieldCI)
+          continue;
+
+        unsigned FieldIdx = FieldCI->getZExtValue();
+        if (FieldIdx >= STy->getNumElements())
+          continue;
+
+        const StructLayout *SL = DL.getStructLayout(STy);
+        uint64_t FieldOffset = SL->getElementOffset(FieldIdx);
+        uint64_t FieldSize =
+            DL.getTypeAllocSize(STy->getElementType(FieldIdx));
+
+        StructAccesses[STy].push_back({FieldIdx, FieldOffset, FieldSize, &I});
+      }
+    }
+
+    // For each struct type accessed, check if any pair of accessed fields
+    // spans a cache line boundary.
+    for (auto &[STy, Accesses] : StructAccesses) {
+      if (Accesses.size() < 2)
+        continue;
+
+      // Deduplicate by field index.
+      SmallSet<unsigned, 8> SeenFields;
+      SmallVector<FieldAccess, 8> UniqueAccesses;
+      for (auto &FA : Accesses) {
+        if (SeenFields.insert(FA.FieldIdx).second)
+          UniqueAccesses.push_back(FA);
+      }
+
+      if (UniqueAccesses.size() < 2)
+        continue;
+
+      // Check pairs: do two accessed fields straddle a 64-byte boundary?
+      for (unsigned I = 0; I < UniqueAccesses.size(); ++I) {
+        for (unsigned J = I + 1; J < UniqueAccesses.size(); ++J) {
+          uint64_t StartA = UniqueAccesses[I].Offset;
+          uint64_t EndA = StartA + UniqueAccesses[I].Size;
+          uint64_t StartB = UniqueAccesses[J].Offset;
+
+          uint64_t MinOffset = std::min(StartA, StartB);
+          uint64_t MaxEnd = std::max(EndA, StartB + UniqueAccesses[J].Size);
+
+          // If the fields together span more than one cache line from
+          // the start of the struct, flag it.
+          uint64_t FirstCacheLine = MinOffset / CacheLineSize;
+          uint64_t LastCacheLine = (MaxEnd - 1) / CacheLineSize;
+
+          if (FirstCacheLine != LastCacheLine) {
+            unsigned Score = scaleByLoopDepth(Impact::Medium, Depth);
+            // Placeholder: use DataLayout until CacheLineSplit enum is added
+            Collector.addHint(makeIRHint(
+                HintCategory::DataLayout, Score, UniqueAccesses[I].Rep,
+                "Loop accesses struct fields at offsets " +
+                    std::to_string(UniqueAccesses[I].Offset) + " and " +
+                    std::to_string(UniqueAccesses[J].Offset) +
+                    " which span a 64-byte cache line boundary.",
+                "Reorder struct fields to keep hot fields within the same "
+                "cache line, or split the struct into hot/cold parts. "
+                "Consider using __attribute__((aligned(64))) for "
+                "cache-line alignment.",
+                F.getName()));
+            goto next_struct; // One hint per struct type per loop.
+          }
+        }
+      }
+    next_struct:;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-TU inlining — calls to small external functions in loops
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkCrossTUInlining(Function &F,
+                                      FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+  for (BasicBlock &BB : F) {
+    unsigned LoopDepth = LI.getLoopDepth(&BB);
+    if (LoopDepth == 0)
+      continue;
+
+    for (Instruction &I : BB) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI)
+        continue;
+
+      Function *Callee = CI->getCalledFunction();
+      if (!Callee || !Callee->isDeclaration() || Callee->isIntrinsic())
+        continue;
+
+      // Skip well-known runtime/library functions that are expected to be
+      // external (malloc, free, math functions, etc.)
+      StringRef Name = Callee->getName();
+      if (Name.starts_with("llvm.") || Name.starts_with("__") ||
+          Name == "malloc" || Name == "free" || Name == "calloc" ||
+          Name == "realloc" || Name == "memcpy" || Name == "memset" ||
+          Name == "memmove" || Name == "printf" || Name == "puts" ||
+          Name == "fprintf" || Name == "sqrt" || Name == "sin" ||
+          Name == "cos" || Name == "exp" || Name == "log" ||
+          Name == "pow" || Name == "fabs")
+        continue;
+
+      // Heuristic: the function has a small number of parameters (likely
+      // small) and is called in a loop — a good LTO candidate.
+      if (Callee->arg_size() <= 4) {
+        unsigned Score = scaleByLoopDepth(Impact::Medium, LoopDepth);
+        // Placeholder: use InliningCandidate until CrossTUInlining enum added
+        Collector.addHint(makeIRHint(
+            HintCategory::InliningCandidate, Score, &I,
+            "Call to external function '" + Callee->getName().str() +
+                "' (declaration only, " +
+                std::to_string(Callee->arg_size()) +
+                " args) inside loop at depth " +
+                std::to_string(LoopDepth) +
+                " — definition is in another translation unit and cannot "
+                "be inlined.",
+            "Enable Link-Time Optimization (-flto) to allow cross-TU "
+            "inlining, or move the function definition to a header file "
+            "as an inline function.",
+            F.getName()));
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hot/cold function attributes — PGO mismatch detection
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkHotColdFunction(Function &F,
+                                      FunctionAnalysisManager &FAM) {
+  // This check requires BlockFrequencyInfo which is only meaningful with PGO.
+  // If no profile data is available, getBlockProfileCount returns None.
+  if (!F.hasProfileData())
+    return;
+
+  auto &BFI = FAM.getResult<BlockFrequencyAnalysis>(F);
+
+  // Sum up the entry block frequency as a proxy for function hotness.
+  BasicBlock &Entry = F.getEntryBlock();
+  auto EntryCount = BFI.getBlockProfileCount(&Entry);
+  if (!EntryCount)
+    return;
+
+  uint64_t Count = *EntryCount;
+
+  bool HasHotAttr = F.hasFnAttribute(Attribute::Hot);
+  bool HasColdAttr = F.hasFnAttribute(Attribute::Cold);
+
+  // Thresholds are heuristic; in practice these should be tunable.
+  constexpr uint64_t HotThreshold = 1000;
+  constexpr uint64_t ColdThreshold = 10;
+
+  Instruction *Rep = Entry.empty() ? nullptr : &Entry.front();
+
+  if (Count >= HotThreshold && !HasHotAttr) {
+    unsigned Score = static_cast<unsigned>(Impact::Low);
+    // Placeholder: use HotColdSplit until HotColdFunction enum is added
+    Collector.addHint(makeIRHint(
+        HintCategory::HotColdSplit, Score, Rep,
+        "Function '" + F.getName().str() +
+            "' has high execution count (" + std::to_string(Count) +
+            ") from PGO profile but is not marked __attribute__((hot)).",
+        "Add __attribute__((hot)) to prioritize this function for "
+        "optimization: aggressive inlining, better code placement, and "
+        "higher optimization effort.",
+        F.getName()));
+  }
+
+  if (Count <= ColdThreshold && !HasColdAttr && Count > 0) {
+    unsigned Score = static_cast<unsigned>(Impact::Low);
+    // Placeholder: use HotColdSplit until HotColdFunction enum is added
+    Collector.addHint(makeIRHint(
+        HintCategory::HotColdSplit, Score, Rep,
+        "Function '" + F.getName().str() +
+            "' has very low execution count (" + std::to_string(Count) +
+            ") from PGO profile but is not marked __attribute__((cold)).",
+        "Add __attribute__((cold)) to deprioritize this function: it will "
+        "be optimized for size instead of speed and placed in a cold "
+        "section to improve instruction cache utilization.",
+        F.getName()));
   }
 }

@@ -37,6 +37,8 @@ public:
   bool VisitCXXThrowExpr(clang::CXXThrowExpr *TE);
   bool VisitBinaryOperator(clang::BinaryOperator *BO);
   bool VisitDeclRefExpr(clang::DeclRefExpr *DRE);
+  bool VisitCXXTryStmt(clang::CXXTryStmt *S);
+  bool VisitLambdaExpr(clang::LambdaExpr *LE);
 
 private:
   clang::ASTContext &Ctx;
@@ -82,6 +84,42 @@ private:
 
   /// Count statements in a compound statement (non-recursive top level).
   unsigned countStatements(const clang::Stmt *S);
+
+  /// Check for false sharing in adjacent atomic/volatile fields.
+  void checkFalseSharing(clang::CXXRecordDecl *RD);
+
+  /// Check for std::string parameters passed by value.
+  void checkStringByValue(clang::FunctionDecl *FD);
+
+  /// Check for push_back/emplace_back without prior reserve() in loops.
+  void checkContainerReserve(clang::Stmt *LoopBody, clang::SourceLocation Loc);
+
+  /// Check for index-based for loops convertible to range-for.
+  void checkRangeForConversion(clang::ForStmt *S);
+
+  /// Check for if-conditions that could be if constexpr.
+  void checkConstexprIf(clang::IfStmt *S);
+
+  /// Check for large lambda captures by value.
+  void checkLambdaCaptureOpt(clang::LambdaExpr *LE);
+
+  /// Check for output parameters that could be return values.
+  void checkOutputParamToReturn(clang::FunctionDecl *FD);
+
+  /// Helper: check if a type name contains a substring.
+  bool typeNameContains(clang::QualType T, llvm::StringRef Substr);
+
+  /// Helper: check if a statement contains a try/catch.
+  bool containsTryCatch(const clang::Stmt *S);
+
+  /// Helper: check if a function body calls .reserve() on a given variable.
+  bool hasReserveCallFor(const clang::Stmt *Body, const clang::VarDecl *VD);
+
+  /// Helper: find push_back/emplace_back calls in a loop body.
+  void findPushBackCalls(
+      const clang::Stmt *S,
+      llvm::SmallVectorImpl<std::pair<const clang::CXXMemberCallExpr *,
+                                      const clang::VarDecl *>> &Results);
 };
 
 class PerfASTConsumer : public clang::ASTConsumer {

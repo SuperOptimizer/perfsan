@@ -63,6 +63,14 @@ enum class HintCategory : uint8_t {
   StrengthReduction,
   MissingNodiscard,
   SignedLoopCounter,
+  ExceptionCost,
+  FalseSharing,
+  StringByValue,
+  ContainerReserve,
+  RangeForConversion,
+  ConstexprIf,
+  LambdaCaptureOpt,
+  OutputParamToReturn,
 };
 
 /// A single performance hint with source location and impact score.

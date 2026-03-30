@@ -1,0 +1,21 @@
+New HintCategory enum values needed for IR pass checks:
+
+1. BitManipulation
+   - categoryName: "bit-manipulation"
+   - Description: Manual bit manipulation patterns that could use compiler builtins
+
+2. RedundantAtomic
+   - categoryName: "redundant-atomic"
+   - Description: Sequential atomic operations on the same address without intervening uses
+
+3. CacheLineSplit
+   - categoryName: "cache-line-split"
+   - Description: Struct field accesses in loops that span a 64-byte cache line boundary
+
+4. CrossTUInlining
+   - categoryName: "cross-tu-inlining"
+   - Description: Calls to small external (declaration-only) functions in loops
+
+5. HotColdFunction
+   - categoryName: "hot-cold-function"
+   - Description: Functions with mismatched execution frequency and hot/cold attributes (PGO)
