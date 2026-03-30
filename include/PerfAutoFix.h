@@ -13,6 +13,7 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Rewrite/Core/Rewriter.h"
+#include <set>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,10 @@ public:
 private:
   clang::SourceManager &SM;
   clang::Rewriter Rewrite;
+
+  /// Track (file-offset, new-text) pairs to prevent duplicate insertions
+  /// at the same location across multiple applyFixes() calls.
+  std::set<std::pair<unsigned, std::string>> SeenInserts;
 
   // Category-specific fix generators.
   std::vector<AutoFix> fixConstexprPromotion(const PerfHint &H,

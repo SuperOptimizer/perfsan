@@ -17,6 +17,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <set>
 #include <string>
 
 using namespace clang;
@@ -30,6 +31,69 @@ namespace perfsanitizer {
 /// Return true if Loc is valid and not inside a system header.
 static bool isFixableLoc(SourceLocation Loc, const SourceManager &SM) {
   return Loc.isValid() && !SM.isInSystemHeader(Loc);
+}
+
+/// Adjust an Insert fix so that it goes on the line BEFORE Loc instead of at
+/// Loc.  This prevents comments from being spliced into the middle of
+/// declarations / parameter lists / struct headers.
+static SourceLocation getLineStartLoc(SourceLocation Loc,
+                                       const SourceManager &SM) {
+  if (Loc.isInvalid())
+    return Loc;
+  unsigned Line = SM.getSpellingLineNumber(Loc);
+  FileID FID = SM.getFileID(Loc);
+  return SM.translateLineCol(FID, Line, 1);
+}
+
+/// Return true if \p Text contains unbalanced braces, parens, or brackets.
+static bool hasUnbalancedDelimiters(StringRef Text) {
+  int Parens = 0, Braces = 0, Brackets = 0;
+  for (char C : Text) {
+    switch (C) {
+    case '(': ++Parens; break;
+    case ')': --Parens; break;
+    case '{': ++Braces; break;
+    case '}': --Braces; break;
+    case '[': ++Brackets; break;
+    case ']': --Brackets; break;
+    default: break;
+    }
+    if (Parens < 0 || Braces < 0 || Brackets < 0)
+      return true;
+  }
+  return Parens != 0 || Braces != 0 || Brackets != 0;
+}
+
+/// Return true if \p Snippet looks like it is inside a class body or is a
+/// member function definition (not a free function at file scope).
+static bool looksLikeMemberContext(StringRef Snippet) {
+  // If '{' appears before '(' it's likely inside a class body.
+  size_t BracePos = Snippet.find('{');
+  size_t ParenPos = Snippet.find('(');
+  if (BracePos != StringRef::npos && ParenPos != StringRef::npos &&
+      BracePos < ParenPos)
+    return true;
+  // Lambda: starts with '['
+  StringRef Trimmed = Snippet.ltrim();
+  if (!Trimmed.empty() && Trimmed[0] == '[')
+    return true;
+  // Contains '::' before '(' — likely a qualified member definition.
+  if (ParenPos != StringRef::npos) {
+    StringRef BeforeParen = Snippet.substr(0, ParenPos);
+    if (BeforeParen.contains("::"))
+      return true;
+  }
+  return false;
+}
+
+/// Return true if \p Snippet contains types that are not constexpr-eligible.
+static bool hasNonConstexprTypes(StringRef Snippet) {
+  return Snippet.contains("mutex") || Snippet.contains("function<") ||
+         Snippet.contains("thread") || Snippet.contains("lock_guard") ||
+         Snippet.contains("unique_lock") || Snippet.contains("try") ||
+         Snippet.contains("catch") || Snippet.contains("throw") ||
+         Snippet.contains("regex") || Snippet.contains("fstream") ||
+         Snippet.contains("iostream");
 }
 
 /// Read up to \p MaxLen characters of source text starting at \p Loc.
@@ -146,60 +210,44 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
     return fixBoolBranching(Hint, Ctx);
   case HintCategory::PowerOfTwo:
     return fixPowerOfTwo(Hint, Ctx);
-  case HintCategory::SoAvsAoS:
-    return fixSoAComment(Hint, Ctx);
+  // Real source rewrites:
   case HintCategory::Vectorization:
     return fixVectorizePragma(Hint, Ctx);
-  case HintCategory::ExceptionCost:
-    return fixExceptionComment(Hint, Ctx);
-  case HintCategory::MutexInLoop:
-    return fixMutexComment(Hint, Ctx);
-  case HintCategory::StdFunctionOverhead:
-    return fixStdFunctionComment(Hint, Ctx);
   case HintCategory::LoopBound:
     return fixLoopBound(Hint, Ctx);
   case HintCategory::LambdaCaptureOpt:
     return fixLambdaCapture(Hint, Ctx);
-  case HintCategory::TightLoopAllocation:
-    return fixTightAllocComment(Hint, Ctx);
-  case HintCategory::RedundantComputation:
-    return fixRedundantComputComment(Hint, Ctx);
-  case HintCategory::AliasBarrier:
-    return fixAliasBarrier(Hint, Ctx);
   case HintCategory::HotColdSplit:
     return fixHotColdSplit(Hint, Ctx);
-  case HintCategory::RedundantLoad:
-    return fixRedundantLoad(Hint, Ctx);
-  case HintCategory::SROAEscape:
-    return fixSROAEscape(Hint, Ctx);
   case HintCategory::MoveSemantics:
     return fixMoveSemantics(Hint, Ctx);
-  case HintCategory::BranchlessSelect:
-    return fixBranchlessSelect(Hint, Ctx);
-  case HintCategory::LoopUnswitching:
-    return fixLoopUnswitching(Hint, Ctx);
   case HintCategory::SIMDWidth:
     return fixSIMDWidth(Hint, Ctx);
-  case HintCategory::FalseSharing:
-    return fixFalseSharing(Hint, Ctx);
   case HintCategory::ConstexprIf:
     return fixConstexprIf(Hint, Ctx);
-  case HintCategory::OutputParamToReturn:
-    return fixOutputParam(Hint, Ctx);
-  case HintCategory::UnusedInclude:
-    return fixUnusedInclude(Hint, Ctx);
   case HintCategory::SmallFunctionNotInline:
     return fixSmallFunctionInline(Hint, Ctx);
+  // No source rewrite — report mode handles these via stderr:
+  case HintCategory::SoAvsAoS:
+  case HintCategory::ExceptionCost:
+  case HintCategory::MutexInLoop:
+  case HintCategory::StdFunctionOverhead:
+  case HintCategory::TightLoopAllocation:
+  case HintCategory::RedundantComputation:
+  case HintCategory::AliasBarrier:
+  case HintCategory::RedundantLoad:
+  case HintCategory::SROAEscape:
+  case HintCategory::BranchlessSelect:
+  case HintCategory::LoopUnswitching:
+  case HintCategory::FalseSharing:
+  case HintCategory::OutputParamToReturn:
+  case HintCategory::UnusedInclude:
   case HintCategory::SortAlgorithm:
-    return fixSortAlgorithm(Hint, Ctx);
   case HintCategory::BitManipulation:
-    return fixBitManip(Hint, Ctx);
   case HintCategory::RedundantAtomic:
-    return fixRedundantAtomic(Hint, Ctx);
   case HintCategory::CacheLineSplit:
-    return fixCacheLineSplit(Hint, Ctx);
   case HintCategory::CrossTUInlining:
-    return fixCrossTUInline(Hint, Ctx);
+    return {}; // Report-only — suggestions emitted to stderr
   case HintCategory::HotColdFunction:
     return fixHotColdFunc(Hint, Ctx);
   default:
@@ -213,11 +261,28 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
 
 bool PerfAutoFixer::applyFixes(const std::vector<AutoFix> &Fixes) {
   bool AllOk = true;
+
   for (const AutoFix &F : Fixes) {
     if (!F.Loc.isValid()) {
       AllOk = false;
       continue;
     }
+
+    // Safety: reject inserts with unbalanced delimiters.
+    if ((F.FixKind == AutoFix::Insert || F.FixKind == AutoFix::InsertAfter) &&
+        hasUnbalancedDelimiters(F.NewText)) {
+      AllOk = false;
+      continue;
+    }
+
+    // Deduplicate: skip if we already inserted the same text at the same loc.
+    if (F.FixKind == AutoFix::Insert || F.FixKind == AutoFix::InsertAfter) {
+      unsigned Offset = SM.getFileOffset(F.Loc);
+      auto Key = std::make_pair(Offset, F.NewText);
+      if (!SeenInserts.insert(Key).second)
+        continue; // duplicate — skip
+    }
+
     switch (F.FixKind) {
     case AutoFix::Insert:
       if (Rewrite.InsertText(F.Loc, F.NewText, /*InsertAfter=*/false))
@@ -372,6 +437,14 @@ PerfAutoFixer::fixConstexprPromotion(const PerfHint &H, ASTContext &Ctx) {
       Snippet.contains("final"))
     return {};
 
+  // Don't add constexpr to functions using non-literal / non-constexpr types.
+  if (hasNonConstexprTypes(Snippet))
+    return {};
+
+  // Don't add constexpr to destructors.
+  if (Snippet.contains("~"))
+    return {};
+
   // For function constexpr promotion: insert "constexpr " before the return type.
   // For variable constexpr promotion: replace "const " with "constexpr ".
   // Distinguish: if there's a '(' it's a function, otherwise a variable.
@@ -459,8 +532,20 @@ PerfAutoFixer::fixNoexcept(const PerfHint &H, ASTContext &Ctx) {
   if (Trimmed.starts_with("noexcept"))
     return {};
 
-  // Don't auto-fix virtual functions — noexcept changes the signature.
+  // Don't add noexcept near throw expressions — we'd be annotating the wrong
+  // thing (e.g. a throw statement, not a function declaration).
   StringRef BeforeParen = Snippet.substr(0, OpenParen);
+  if (BeforeParen.contains("throw"))
+    return {};
+
+  // Verify we're on a function declaration line (must have a type + name +
+  // parens), not an expression line.  A bare "(" without any identifier-like
+  // text before it is suspicious.
+  StringRef TrimBefore = BeforeParen.trim();
+  if (TrimBefore.empty() || (!isalnum(TrimBefore.back()) && TrimBefore.back() != '_' && TrimBefore.back() != '>'))
+    return {};
+
+  // Don't auto-fix virtual functions — noexcept changes the signature.
   if (BeforeParen.contains("virtual"))
     return {};
 
@@ -986,9 +1071,29 @@ PerfAutoFixer::fixVirtualDevirt(const PerfHint &H, ASTContext &Ctx) {
   if (Snippet.empty())
     return {};
 
-  // Safety: skip if already final.
+  // Safety: skip if already final (with or without spaces).
   if (Snippet.contains("final"))
     return {};
+
+  // Don't apply to struct/class declarations — only to methods.
+  // If the snippet starts with "struct" or "class", this is a type decl.
+  StringRef TrimSnippet = Snippet.ltrim();
+  if (TrimSnippet.starts_with("struct ") || TrimSnippet.starts_with("class "))
+    return {};
+
+  // Verify this looks like a function (must have parens).
+  if (!Snippet.contains("("))
+    return {};
+
+  // Don't apply if this looks like a class/struct with inheritance.
+  // Pattern: "Name : BaseClass {" without '(' before the ':'.
+  size_t ColonPos = Snippet.find(':');
+  size_t FirstParen = Snippet.find('(');
+  if (ColonPos != StringRef::npos && FirstParen != StringRef::npos &&
+      ColonPos < FirstParen) {
+    // Colon before paren — likely inheritance, not a method.
+    return {};
+  }
 
   // Look for "override" in the method declaration.
   size_t OverridePos = Snippet.find("override");
@@ -1005,10 +1110,49 @@ PerfAutoFixer::fixVirtualDevirt(const PerfHint &H, ASTContext &Ctx) {
     return {Fix};
   }
 
-  // No "override" — insert "final " before '{'.
+  // No "override" — only insert "final" if this looks like a method
+  // definition with a closing ')' before '{'.
+  // Walk forward to find the first '{' that is directly preceded by ')' or
+  // ')' + qualifiers (const, volatile, etc.), indicating a function body.
+  // Reject '{' that follows a class name / base-class list.
   size_t BracePos = Snippet.find('{');
   if (BracePos == StringRef::npos)
     return {};
+
+  // Ensure the last non-whitespace before '{' is ')' or a qualifier keyword
+  // (const, volatile), not a class name.
+  StringRef BeforeBrace = Snippet.substr(0, BracePos).rtrim();
+  if (BeforeBrace.empty())
+    return {};
+
+  // The text before '{' should end with ')' or a qualifier after ')'.
+  // Find the last ')' before '{'.
+  size_t LastCloseParen = BeforeBrace.rfind(')');
+  if (LastCloseParen == StringRef::npos)
+    return {};
+
+  // Between ')' and '{' should only be whitespace and qualifiers
+  // (const, volatile, noexcept, override, =0, etc.), not a class name.
+  StringRef BetweenParenAndBrace = BeforeBrace.substr(LastCloseParen + 1).trim();
+  // If there's content that's not a known qualifier, bail.
+  if (!BetweenParenAndBrace.empty()) {
+    // Check that remaining tokens are known method qualifiers.
+    StringRef Remaining = BetweenParenAndBrace;
+    while (!Remaining.empty()) {
+      Remaining = Remaining.ltrim();
+      bool FoundQual = false;
+      for (const char *Qual : {"const", "volatile", "noexcept", "=", "0",
+                                "override", "final", "&", "&&"}) {
+        if (Remaining.starts_with(Qual)) {
+          Remaining = Remaining.substr(strlen(Qual));
+          FoundQual = true;
+          break;
+        }
+      }
+      if (!FoundQual)
+        return {}; // Unknown token — likely a class name, bail.
+    }
+  }
 
   SourceLocation InsertLoc = Loc.getLocWithOffset(BracePos);
 
@@ -1071,8 +1215,14 @@ PerfAutoFixer::fixDataLayout(const PerfHint &H, ASTContext &Ctx) {
   if (Snippet.contains("PERF: reorder fields"))
     return {};
 
+  // Insert the comment on the line containing Loc (at column 1), not at Loc
+  // itself, to avoid breaking "struct Name {".
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = "// PERF: reorder fields by size (largest first) to reduce "
                 "padding\n";
@@ -1464,14 +1614,18 @@ PerfAutoFixer::fixRangeForConversion(const PerfHint &H, ASTContext &Ctx) {
   if (Snippet.contains("PERF: consider range-for"))
     return {};
 
-  // Get indentation.
+  // Get indentation and insert at line start to avoid breaking code.
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent;
   if (Col > 1)
     Indent.assign(Col - 1, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText =
       Indent +
@@ -1527,6 +1681,16 @@ PerfAutoFixer::fixExceptionInDestructor(const PerfHint &H, ASTContext &Ctx) {
 
   // Already noexcept?
   if (Snippet.contains("noexcept"))
+    return {};
+
+  // Don't add noexcept if the snippet is a throw expression, not a function
+  // declaration.
+  StringRef FirstLine = Snippet.split('\n').first.trim();
+  if (FirstLine.starts_with("throw") || FirstLine.contains("throw "))
+    return {};
+
+  // Verify we're looking at a destructor declaration (should contain '~').
+  if (!Snippet.contains("~"))
     return {};
 
   // Find the closing ')' of the destructor parameter list.
@@ -1768,10 +1932,17 @@ PerfAutoFixer::fixBoolBranching(const PerfHint &H, ASTContext &Ctx) {
 
   // Find the end of the entire if/else construct.
   size_t EndPos = AfterCond.find("return false;") + strlen("return false;");
-  // Account for closing brace if present.
-  StringRef AfterRetFalse = AfterCond.substr(EndPos).ltrim();
-  if (AfterRetFalse.starts_with("}"))
-    EndPos += (AfterRetFalse.data() - AfterCond.substr(EndPos).data()) + 1;
+  // Only consume a closing '}' if it belongs to the else-block, not the
+  // enclosing function body.  Check whether there's an "else {" before
+  // "return false;" — if so, the '}' after is the else-block's brace.
+  StringRef BeforeRetFalse = AfterCond.substr(0, RetFalsePos);
+  bool ElseIsBraced = BeforeRetFalse.rfind('{') != StringRef::npos &&
+                      BeforeRetFalse.rfind('{') > BeforeRetFalse.rfind("else");
+  if (ElseIsBraced) {
+    StringRef AfterRetFalse = AfterCond.substr(EndPos).ltrim();
+    if (AfterRetFalse.starts_with("}"))
+      EndPos += (AfterRetFalse.data() - AfterCond.substr(EndPos).data()) + 1;
+  }
 
   // Total extent from "if" to end.
   size_t TotalLen = (ParenClose + 1 - IfPos) + EndPos;
@@ -1906,8 +2077,12 @@ PerfAutoFixer::fixSoAComment(const PerfHint &H, ASTContext &Ctx) {
   if (Col > 1)
     Indent.assign(Col - 1, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: restructure to SoA for vectorization\n";
   Fix.Description = "suggest SoA restructuring for better vectorization";
@@ -1932,8 +2107,12 @@ PerfAutoFixer::fixVectorizePragma(const PerfHint &H, ASTContext &Ctx) {
   if (Col > 1)
     Indent.assign(Col - 1, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "#pragma clang loop vectorize(enable)\n";
   Fix.Description = "add vectorization pragma before loop";
@@ -1957,8 +2136,12 @@ PerfAutoFixer::fixExceptionComment(const PerfHint &H, ASTContext &Ctx) {
   if (Col > 1)
     Indent.assign(Col - 1, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: move try/catch outside this loop\n";
   Fix.Description = "suggest moving exception handling outside loop";
@@ -1982,8 +2165,12 @@ PerfAutoFixer::fixMutexComment(const PerfHint &H, ASTContext &Ctx) {
   if (Col > 1)
     Indent.assign(Col - 1, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: move lock outside loop, or use lock-free\n";
   Fix.Description = "suggest moving mutex lock outside loop";
@@ -2007,8 +2194,12 @@ PerfAutoFixer::fixStdFunctionComment(const PerfHint &H, ASTContext &Ctx) {
   if (Col > 1)
     Indent.assign(Col - 1, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: use template param instead of std::function\n";
   Fix.Description = "suggest template parameter instead of std::function";
@@ -2071,16 +2262,23 @@ PerfAutoFixer::fixLoopBound(const PerfHint &H, ASTContext &Ctx) {
   if (Snippet.contains("__builtin_assume"))
     return {};
 
-  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  // Compute indentation from the for-loop line.
+  // If ForPos > 0, adjust to the for-loop's actual location.
+  SourceLocation ForLoc = Loc.getLocWithOffset(ForPos);
+  unsigned ForCol = SM.getSpellingColumnNumber(ForLoc);
   std::string Indent;
-  if (Col > 1)
-    Indent.assign(Col - 1, ' ');
+  if (ForCol > 1)
+    Indent.assign(ForCol - 1, ' ');
 
   std::string AssumeLine = Indent + "__builtin_assume(" + Bound.str() +
                             " > 0 && " + Bound.str() + " <= 1024);\n";
 
+  SourceLocation LineStart = getLineStartLoc(ForLoc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = AssumeLine;
   Fix.Description = "add __builtin_assume to help loop bound analysis";
@@ -2131,8 +2329,12 @@ PerfAutoFixer::fixTightAllocComment(const PerfHint &H, ASTContext &Ctx) {
   if (Col > 1)
     Indent.assign(Col - 1, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: hoist allocation outside loop\n";
   Fix.Description = "suggest hoisting allocation outside tight loop";
@@ -2156,8 +2358,12 @@ PerfAutoFixer::fixRedundantComputComment(const PerfHint &H, ASTContext &Ctx) {
   if (Col > 1)
     Indent.assign(Col - 1, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: hoist invariant computation outside loop\n";
   Fix.Description = "suggest hoisting invariant computation outside loop";
@@ -2185,8 +2391,12 @@ PerfAutoFixer::fixAliasBarrier(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: add __restrict__ or #pragma clang loop "
                 "vectorize(assume_safety)\n";
@@ -2234,8 +2444,12 @@ PerfAutoFixer::fixRedundantLoad(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: hoist repeated load to a local variable\n";
   Fix.Description = "suggest hoisting repeated load to a local variable";
@@ -2257,8 +2471,12 @@ PerfAutoFixer::fixSROAEscape(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: pass struct fields individually instead of "
                 "pointer\n";
@@ -2337,8 +2555,12 @@ PerfAutoFixer::fixBranchlessSelect(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: use ternary (cond ? a : b) for branchless "
                 "select\n";
@@ -2361,8 +2583,12 @@ PerfAutoFixer::fixLoopUnswitching(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: hoist loop-invariant condition outside the "
                 "loop\n";
@@ -2386,8 +2612,12 @@ PerfAutoFixer::fixSIMDWidth(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "#pragma clang loop vectorize(enable)\n";
   Fix.Description = "add vectorization pragma to widen SIMD width";
@@ -2410,8 +2640,12 @@ PerfAutoFixer::fixFalseSharing(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: add alignas(64) padding between atomic "
                 "fields to prevent false sharing\n";
@@ -2469,8 +2703,12 @@ PerfAutoFixer::fixOutputParam(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: return by value instead of output "
                 "parameter\n";
@@ -2493,8 +2731,12 @@ PerfAutoFixer::fixUnusedInclude(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: consider forward declaration instead of "
                 "full include\n";
@@ -2512,13 +2754,17 @@ PerfAutoFixer::fixSmallFunctionInline(const PerfHint &H, ASTContext &Ctx) {
     return {};
 
   // Safety: skip if already inline or __forceinline.
-  if (Snippet.ltrim().starts_with("inline") ||
+  if (Snippet.contains("inline") ||
       Snippet.contains("__forceinline") ||
       Snippet.contains("always_inline"))
     return {};
 
   // Verify this looks like a function declaration.
   if (!Snippet.contains("("))
+    return {};
+
+  // Don't insert 'inline' on member functions inside a class body or lambdas.
+  if (looksLikeMemberContext(Snippet))
     return {};
 
   AutoFix Fix;
@@ -2544,8 +2790,12 @@ PerfAutoFixer::fixSortAlgorithm(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: use std::sort() instead of manual sort "
                 "implementation\n";
@@ -2568,8 +2818,12 @@ PerfAutoFixer::fixBitManip(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: use __builtin_popcount/__builtin_ctz "
                 "instead of manual bit counting\n";
@@ -2592,8 +2846,12 @@ PerfAutoFixer::fixRedundantAtomic(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: batch sequential atomic operations or use "
                 "relaxed ordering\n";
@@ -2617,8 +2875,12 @@ PerfAutoFixer::fixCacheLineSplit(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: add padding (alignas(64)) to prevent cache "
                 "line splitting\n";
@@ -2641,8 +2903,12 @@ PerfAutoFixer::fixCrossTUInline(const PerfHint &H, ASTContext &Ctx) {
   unsigned Col = SM.getSpellingColumnNumber(Loc);
   std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
 
+  SourceLocation LineStart = getLineStartLoc(Loc, SM);
+  if (LineStart.isInvalid())
+    return {};
+
   AutoFix Fix;
-  Fix.Loc = Loc;
+  Fix.Loc = LineStart;
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: move function definition to header or "
                 "enable LTO for cross-TU inlining\n";
