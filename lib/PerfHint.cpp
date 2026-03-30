@@ -120,6 +120,42 @@ const char *PerfHint::categoryName() const {
     return "cross-tu-inlining";
   case HintCategory::HotColdFunction:
     return "hot-cold-function";
+  case HintCategory::EmptyLoopBody:
+    return "empty-loop-body";
+  case HintCategory::DuplicateCondition:
+    return "duplicate-condition";
+  case HintCategory::StringConcatInLoop:
+    return "string-concat-in-loop";
+  case HintCategory::RegexInLoop:
+    return "regex-in-loop";
+  case HintCategory::DynamicCastInLoop:
+    return "dynamic-cast-in-loop";
+  case HintCategory::VirtualDtorMissing:
+    return "virtual-dtor-missing";
+  case HintCategory::CopyInRangeFor:
+    return "copy-in-range-for";
+  case HintCategory::ThrowInNoexcept:
+    return "throw-in-noexcept";
+  case HintCategory::GlobalVarInLoop:
+    return "global-var-in-loop";
+  case HintCategory::VolatileInLoop:
+    return "volatile-in-loop";
+  case HintCategory::ImplicitConversion:
+    return "implicit-conversion";
+  case HintCategory::SlicingCopy:
+    return "slicing-copy";
+  case HintCategory::DivisionChain:
+    return "division-chain";
+  case HintCategory::SpillPressure:
+    return "spill-pressure";
+  case HintCategory::UnrollingBlocker:
+    return "unrolling-blocker";
+  case HintCategory::BranchOnFloat:
+    return "branch-on-float";
+  case HintCategory::MemoryAccessPattern:
+    return "memory-access-pattern";
+  case HintCategory::SmallFunctionInline:
+    return "small-function-inline";
   }
   return "unknown";
 }

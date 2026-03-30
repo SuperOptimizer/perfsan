@@ -12,9 +12,11 @@
 #include "PerfHint.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/Stmt.h"
+#include "clang/AST/StmtCXX.h"
 
 namespace perfsanitizer {
 
@@ -144,6 +146,68 @@ void checkStdFunctionOverhead(const clang::VarDecl *VD,
                               clang::ASTContext &Ctx,
                               PerfHintCollector &Collector,
                               unsigned LoopDepth);
+
+/// Detect for/while loops with empty body (null body or empty CompoundStmt).
+void checkEmptyLoopBody(const clang::ForStmt *FS, clang::ASTContext &Ctx,
+                        PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Detect if(a) ... else if(a) where both conditions are textually identical.
+void checkDuplicateCondition(const clang::IfStmt *IS, clang::ASTContext &Ctx,
+                             PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Find operator+= on std::string inside loops.
+void checkStringConcatInLoop(const clang::Stmt *LoopBody,
+                             clang::ASTContext &Ctx,
+                             PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Find CXXConstructExpr of std::regex / std::basic_regex inside a loop.
+void checkRegexInLoop(const clang::Stmt *LoopBody, clang::ASTContext &Ctx,
+                      PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Find CXXDynamicCastExpr inside loops.
+void checkDynamicCastInLoop(const clang::Stmt *LoopBody,
+                            clang::ASTContext &Ctx,
+                            PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Base class with virtual methods but non-virtual destructor.
+void checkVirtualDtorMissing(const clang::CXXRecordDecl *RD,
+                             clang::ASTContext &Ctx,
+                             PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Range-for where the loop variable is by value and element type is
+/// non-trivial or >64 bytes.
+void checkCopyInRangeFor(const clang::CXXForRangeStmt *S,
+                         clang::ASTContext &Ctx, PerfHintCollector &Collector,
+                         unsigned LoopDepth);
+
+/// throw expression inside a noexcept function.
+void checkThrowInNoexcept(const clang::CXXThrowExpr *TE,
+                          const clang::FunctionDecl *EnclosingFD,
+                          clang::ASTContext &Ctx,
+                          PerfHintCollector &Collector);
+
+/// DeclRefExpr referencing a global/namespace-scope variable inside a loop.
+void checkGlobalVarInLoop(const clang::Stmt *LoopBody, clang::ASTContext &Ctx,
+                          PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Load/store of volatile variable inside a loop.
+void checkVolatileInLoop(const clang::Stmt *LoopBody, clang::ASTContext &Ctx,
+                         PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Narrowing implicit conversion (double->float, long->int, etc.) in loops.
+void checkImplicitConversion(const clang::ImplicitCastExpr *ICE,
+                             clang::ASTContext &Ctx,
+                             PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Passing a derived class object by value to a function taking a base class
+/// by value (object slicing).
+void checkSlicingCopy(const clang::CallExpr *CE, clang::ASTContext &Ctx,
+                      PerfHintCollector &Collector, unsigned LoopDepth);
+
+/// Multiple divisions by the same variable in a block — suggest computing
+/// reciprocal once.
+void checkDivisionChain(const clang::BinaryOperator *BO, clang::ASTContext &Ctx,
+                        PerfHintCollector &Collector, unsigned LoopDepth);
 
 } // namespace perfsanitizer
 

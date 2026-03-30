@@ -1127,6 +1127,7 @@ bool PerfASTVisitor::VisitFunctionDecl(FunctionDecl *FD) {
   checkSmallFunctionNotInline(FD, Ctx, Collector);
   checkUnnecessaryCopy(FD, Ctx, Collector);
   checkStdFunctionOverhead(FD, Ctx, Collector, 0);
+  checkUnusedInclude(FD, Ctx, Collector, 0);
 
   return true;
 }
@@ -1214,6 +1215,9 @@ bool PerfASTVisitor::VisitCXXRecordDecl(CXXRecordDecl *RD) {
 
   // Check for false sharing among atomic/volatile fields.
   checkFalseSharing(RD);
+
+  // Check for missing virtual destructor.
+  checkVirtualDtorMissing(RD, Ctx, Collector, 0);
 
   return true;
 }
@@ -1342,6 +1346,12 @@ bool PerfASTVisitor::VisitForStmt(ForStmt *S) {
   checkSortAlgorithm(S, Ctx, Collector, CurrentLoopDepth);
   checkMemcpyOpportunity(S, Ctx, Collector, CurrentLoopDepth);
   checkMutexInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkEmptyLoopBody(S, Ctx, Collector, CurrentLoopDepth);
+  checkStringConcatInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkRegexInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkDynamicCastInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkGlobalVarInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkVolatileInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
 
   // After visiting children, decrement.
   // Note: RecursiveASTVisitor handles child traversal; we manage depth here.
@@ -1372,6 +1382,11 @@ bool PerfASTVisitor::VisitWhileStmt(WhileStmt *S) {
   // Extra checks from PerfASTExtraChecks
   checkTightLoopAllocation(S->getBody(), Ctx, Collector, CurrentLoopDepth);
   checkMutexInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkStringConcatInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkRegexInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkDynamicCastInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkGlobalVarInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkVolatileInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
 
   --CurrentLoopDepth;
   return true;
@@ -1439,6 +1454,7 @@ bool PerfASTVisitor::VisitIfStmt(IfStmt *S) {
   // Extra checks from PerfASTExtraChecks
   checkBoolBranching(S, Ctx, Collector);
   checkBranchFreePredicate(S, Ctx, Collector, CurrentLoopDepth);
+  checkDuplicateCondition(S, Ctx, Collector, CurrentLoopDepth);
 
   return true;
 }
@@ -1494,6 +1510,7 @@ bool PerfASTVisitor::VisitCallExpr(CallExpr *CE) {
   // Extra checks from PerfASTExtraChecks
   checkSmallVectorSize(CE, Ctx, Collector, CurrentLoopDepth);
   checkVirtualInLoop(CE, Ctx, Collector, CurrentLoopDepth);
+  checkSlicingCopy(CE, Ctx, Collector, CurrentLoopDepth);
 
   return true;
 }
@@ -1540,7 +1557,22 @@ bool PerfASTVisitor::VisitCXXNewExpr(CXXNewExpr *NE) {
 // ---------------------------------------------------------------------------
 
 bool PerfASTVisitor::VisitCXXThrowExpr(CXXThrowExpr *TE) {
-  // No hint needed here; we handle noexcept at the function level.
+  if (SM.isInSystemHeader(TE->getBeginLoc()))
+    return true;
+
+  // Find enclosing function via parent map for checkThrowInNoexcept.
+  clang::DynTypedNodeList Parents = Ctx.getParents(*TE);
+  const FunctionDecl *EnclosingFD = nullptr;
+  for (int Depth = 0; Depth < 20 && !Parents.empty(); ++Depth) {
+    if (const auto *FD = Parents[0].get<FunctionDecl>()) {
+      EnclosingFD = FD;
+      break;
+    }
+    Parents = Ctx.getParents(Parents[0]);
+  }
+  if (EnclosingFD)
+    checkThrowInNoexcept(TE, EnclosingFD, Ctx, Collector);
+
   return true;
 }
 
@@ -1579,7 +1611,47 @@ bool PerfASTVisitor::VisitBinaryOperator(BinaryOperator *BO) {
   // Extra checks from PerfASTExtraChecks
   checkPowerOfTwo(BO, Ctx, Collector, CurrentLoopDepth);
   checkEmptyVsSize(BO, Ctx, Collector, CurrentLoopDepth);
+  checkDivisionChain(BO, Ctx, Collector, CurrentLoopDepth);
 
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Unary operators — pre-increment preference
+// ---------------------------------------------------------------------------
+
+bool PerfASTVisitor::VisitUnaryOperator(UnaryOperator *UO) {
+  if (SM.isInSystemHeader(UO->getBeginLoc()))
+    return true;
+
+  if (CurrentLoopDepth > 0)
+    checkPreIncrement(UO, Ctx, Collector, CurrentLoopDepth);
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Range-for statements — copy-in-range-for check
+// ---------------------------------------------------------------------------
+
+bool PerfASTVisitor::VisitCXXForRangeStmt(CXXForRangeStmt *S) {
+  if (SM.isInSystemHeader(S->getBeginLoc()))
+    return true;
+
+  ++CurrentLoopDepth;
+
+  checkCopyInRangeFor(S, Ctx, Collector, CurrentLoopDepth);
+
+  // Also run loop-body checks on the range-for body.
+  checkStringConcatInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkRegexInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkDynamicCastInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkGlobalVarInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkVolatileInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkTightLoopAllocation(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+  checkMutexInLoop(S->getBody(), Ctx, Collector, CurrentLoopDepth);
+
+  --CurrentLoopDepth;
   return true;
 }
 

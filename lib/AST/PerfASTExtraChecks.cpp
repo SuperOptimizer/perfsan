@@ -18,7 +18,10 @@
 #include "clang/AST/StmtIterator.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Type.h"
+#include "clang/Basic/ExceptionSpecificationType.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Lex/Lexer.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include <cmath>
 
@@ -1429,4 +1432,572 @@ void perfsanitizer::checkStdFunctionOverhead(const VarDecl *VD,
                VD->getLocation(), Ctx, Msg,
                "Use auto with a lambda, a function pointer, or a "
                "template parameter to avoid std::function overhead"));
+}
+
+// ---------------------------------------------------------------------------
+// 24. EmptyLoopBody
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkEmptyLoopBody(const ForStmt *FS, ASTContext &Ctx,
+                                       PerfHintCollector &Collector,
+                                       unsigned LoopDepth) {
+  if (!FS)
+    return;
+
+  const Stmt *Body = FS->getBody();
+  bool IsEmpty = false;
+  if (!Body) {
+    IsEmpty = true;
+  } else if (const auto *CS = dyn_cast<CompoundStmt>(Body)) {
+    if (CS->body_empty())
+      IsEmpty = true;
+  } else if (isa<NullStmt>(Body)) {
+    IsEmpty = true;
+  }
+
+  if (!IsEmpty)
+    return;
+
+  Collector.addHint(
+      makeHint(HintCategory::EmptyLoopBody, Impact::Medium, LoopDepth,
+               FS->getForLoc(), Ctx,
+               "For-loop has an empty body — likely a bug or busy-wait",
+               "If this is intentional, add a comment. Otherwise, add the "
+               "intended loop body or remove the loop"));
+}
+
+// ---------------------------------------------------------------------------
+// 25. DuplicateCondition
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkDuplicateCondition(const IfStmt *IS, ASTContext &Ctx,
+                                            PerfHintCollector &Collector,
+                                            unsigned LoopDepth) {
+  if (!IS)
+    return;
+
+  // Look for else-if chain: if (a) ... else if (a) ...
+  const Stmt *ElseBranch = IS->getElse();
+  if (!ElseBranch)
+    return;
+  const auto *ElseIf = dyn_cast<IfStmt>(ElseBranch);
+  if (!ElseIf)
+    return;
+
+  const Expr *Cond1 = IS->getCond();
+  const Expr *Cond2 = ElseIf->getCond();
+  if (!Cond1 || !Cond2)
+    return;
+
+  const SourceManager &SM = Ctx.getSourceManager();
+  const LangOptions &LO = Ctx.getLangOpts();
+
+  CharSourceRange R1 = CharSourceRange::getTokenRange(Cond1->getSourceRange());
+  CharSourceRange R2 = CharSourceRange::getTokenRange(Cond2->getSourceRange());
+
+  StringRef Text1 = Lexer::getSourceText(R1, SM, LO);
+  StringRef Text2 = Lexer::getSourceText(R2, SM, LO);
+
+  if (Text1.empty() || Text2.empty() || Text1 != Text2)
+    return;
+
+  Collector.addHint(makeHint(
+      HintCategory::DuplicateCondition, Impact::Medium, LoopDepth,
+      ElseIf->getIfLoc(), Ctx,
+      "Duplicate condition '" + Text1.str() +
+          "' in if/else-if chain — the else-if branch is unreachable",
+      "Remove the duplicate branch or fix the condition"));
+}
+
+// ---------------------------------------------------------------------------
+// 26. StringConcatInLoop
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkStringConcatInLoop(const Stmt *LoopBody,
+                                            ASTContext &Ctx,
+                                            PerfHintCollector &Collector,
+                                            unsigned LoopDepth) {
+  if (!LoopBody || LoopDepth == 0)
+    return;
+
+  std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *OpCall = dyn_cast<CXXOperatorCallExpr>(S)) {
+      if (OpCall->getOperator() == OO_PlusEqual && OpCall->getNumArgs() >= 1) {
+        QualType T = OpCall->getArg(0)->getType();
+        if (typeNameContains(T, "basic_string")) {
+          Collector.addHint(makeHint(
+              HintCategory::StringConcatInLoop, Impact::High, LoopDepth,
+              OpCall->getOperatorLoc(), Ctx,
+              "operator+= on std::string inside loop (depth " +
+                  std::to_string(LoopDepth) +
+                  "); may cause repeated reallocations",
+              "Use std::string::reserve() before the loop, or build with "
+              "std::ostringstream / fmt::format for large concatenations"));
+        }
+      }
+    }
+    for (const Stmt *Child : S->children())
+      Walk(Child);
+  };
+  Walk(LoopBody);
+}
+
+// ---------------------------------------------------------------------------
+// 27. RegexInLoop
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkRegexInLoop(const Stmt *LoopBody, ASTContext &Ctx,
+                                     PerfHintCollector &Collector,
+                                     unsigned LoopDepth) {
+  if (!LoopBody || LoopDepth == 0)
+    return;
+
+  std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *CE = dyn_cast<CXXConstructExpr>(S)) {
+      QualType T = CE->getType();
+      if (typeNameContains(T, "basic_regex") || typeNameContains(T, "std::regex")) {
+        Collector.addHint(makeHint(
+            HintCategory::RegexInLoop, Impact::Critical, LoopDepth,
+            CE->getBeginLoc(), Ctx,
+            "std::regex constructed inside loop (depth " +
+                std::to_string(LoopDepth) +
+                "); regex compilation is extremely expensive",
+            "Hoist the std::regex construction outside the loop — compile "
+            "the pattern once and reuse it"));
+      }
+    }
+    for (const Stmt *Child : S->children())
+      Walk(Child);
+  };
+  Walk(LoopBody);
+}
+
+// ---------------------------------------------------------------------------
+// 28. DynamicCastInLoop
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkDynamicCastInLoop(const Stmt *LoopBody,
+                                           ASTContext &Ctx,
+                                           PerfHintCollector &Collector,
+                                           unsigned LoopDepth) {
+  if (!LoopBody || LoopDepth == 0)
+    return;
+
+  std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *DC = dyn_cast<CXXDynamicCastExpr>(S)) {
+      Collector.addHint(makeHint(
+          HintCategory::DynamicCastInLoop, Impact::High, LoopDepth,
+          DC->getBeginLoc(), Ctx,
+          "dynamic_cast inside loop (depth " + std::to_string(LoopDepth) +
+              "); RTTI lookup is expensive in tight loops",
+          "Consider using static_cast if the type is known, or redesign "
+          "with virtual methods / std::variant to avoid RTTI"));
+    }
+    for (const Stmt *Child : S->children())
+      Walk(Child);
+  };
+  Walk(LoopBody);
+}
+
+// ---------------------------------------------------------------------------
+// 29. VirtualDtorMissing
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkVirtualDtorMissing(const CXXRecordDecl *RD,
+                                            ASTContext &Ctx,
+                                            PerfHintCollector &Collector,
+                                            unsigned LoopDepth) {
+  if (!RD || !RD->isCompleteDefinition() || !RD->isPolymorphic())
+    return;
+
+  // Check if any method is virtual.
+  bool HasVirtualMethod = false;
+  for (const auto *M : RD->methods()) {
+    if (M->isVirtual() && !isa<CXXDestructorDecl>(M)) {
+      HasVirtualMethod = true;
+      break;
+    }
+  }
+  if (!HasVirtualMethod)
+    return;
+
+  // Check if destructor is virtual.
+  if (const auto *Dtor = RD->getDestructor()) {
+    if (Dtor->isVirtual())
+      return;
+  }
+
+  Collector.addHint(makeHint(
+      HintCategory::VirtualDtorMissing, Impact::High, LoopDepth,
+      RD->getLocation(), Ctx,
+      "Class '" + RD->getNameAsString() +
+          "' has virtual methods but a non-virtual destructor — "
+          "deleting through a base pointer is undefined behavior",
+      "Declare the destructor virtual: 'virtual ~" +
+          RD->getNameAsString() + "() = default;'"));
+}
+
+// ---------------------------------------------------------------------------
+// 30. CopyInRangeFor
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkCopyInRangeFor(const CXXForRangeStmt *S,
+                                        ASTContext &Ctx,
+                                        PerfHintCollector &Collector,
+                                        unsigned LoopDepth) {
+  if (!S)
+    return;
+
+  const VarDecl *LoopVar = S->getLoopVariable();
+  if (!LoopVar)
+    return;
+
+  QualType T = LoopVar->getType();
+  // If it's already a reference, no copy.
+  if (T->isReferenceType())
+    return;
+
+  // Check if the element type is non-trivial or large.
+  bool ShouldFlag = false;
+  std::string Reason;
+
+  if (isNonTrivialType(T)) {
+    ShouldFlag = true;
+    Reason = "has a non-trivial copy constructor";
+  } else if (typeNameContains(T, "basic_string") ||
+             typeNameContains(T, "vector") ||
+             typeNameContains(T, "map") ||
+             typeNameContains(T, "set")) {
+    ShouldFlag = true;
+    Reason = "is a standard container type";
+  } else if (T->isRecordType()) {
+    if (const RecordType *RT = T->getAs<RecordType>()) {
+      const RecordDecl *RecD = RT->getDecl();
+      if (RecD->isCompleteDefinition()) {
+        uint64_t Size = Ctx.getTypeSize(T) / 8;
+        if (Size > 64) {
+          ShouldFlag = true;
+          Reason = "is " + std::to_string(Size) + " bytes";
+        }
+      }
+    }
+  }
+
+  if (!ShouldFlag)
+    return;
+
+  Collector.addHint(makeHint(
+      HintCategory::CopyInRangeFor, Impact::Medium, LoopDepth,
+      LoopVar->getLocation(), Ctx,
+      "Range-for loop variable '" + LoopVar->getNameAsString() +
+          "' copies each element (type " + Reason +
+          "); this creates an expensive copy every iteration",
+      "Use 'const auto&' or 'auto&' to avoid copying: "
+      "'for (const auto& " +
+          LoopVar->getNameAsString() + " : ...)'"));
+}
+
+// ---------------------------------------------------------------------------
+// 31. ThrowInNoexcept
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkThrowInNoexcept(const CXXThrowExpr *TE,
+                                         const FunctionDecl *EnclosingFD,
+                                         ASTContext &Ctx,
+                                         PerfHintCollector &Collector) {
+  if (!TE || !EnclosingFD)
+    return;
+
+  auto *FPT = EnclosingFD->getType()->getAs<FunctionProtoType>();
+  if (!FPT)
+    return;
+
+  if (!isNoexceptExceptionSpec(FPT->getExceptionSpecType()))
+    return;
+
+  Collector.addHint(makeHint(
+      HintCategory::ThrowInNoexcept, Impact::High, /*LoopDepth=*/0,
+      TE->getThrowLoc(), Ctx,
+      "throw expression inside noexcept function '" +
+          EnclosingFD->getNameAsString() +
+          "' — this will call std::terminate at runtime",
+      "Remove the throw, use a different error reporting mechanism, "
+      "or remove noexcept from the function if it can legitimately throw"));
+}
+
+// ---------------------------------------------------------------------------
+// 32. GlobalVarInLoop
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkGlobalVarInLoop(const Stmt *LoopBody,
+                                         ASTContext &Ctx,
+                                         PerfHintCollector &Collector,
+                                         unsigned LoopDepth) {
+  if (!LoopBody || LoopDepth == 0)
+    return;
+
+  std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
+      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+        if (VD->hasGlobalStorage() && !VD->isStaticLocal() &&
+            !VD->getType().isConstQualified()) {
+          Collector.addHint(makeHint(
+              HintCategory::GlobalVarInLoop, Impact::Medium, LoopDepth,
+              DRE->getBeginLoc(), Ctx,
+              "Reference to global/namespace-scope variable '" +
+                  VD->getNameAsString() +
+                  "' inside loop (depth " + std::to_string(LoopDepth) +
+                  "); may inhibit optimization due to aliasing",
+              "Cache the value in a local variable before the loop if "
+              "the global is not modified by other threads"));
+        }
+      }
+    }
+    for (const Stmt *Child : S->children())
+      Walk(Child);
+  };
+  Walk(LoopBody);
+}
+
+// ---------------------------------------------------------------------------
+// 33. VolatileInLoop
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkVolatileInLoop(const Stmt *LoopBody, ASTContext &Ctx,
+                                        PerfHintCollector &Collector,
+                                        unsigned LoopDepth) {
+  if (!LoopBody || LoopDepth == 0)
+    return;
+
+  std::function<void(const Stmt *)> Walk = [&](const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(S)) {
+      QualType T = DRE->getType();
+      if (T.isVolatileQualified()) {
+        Collector.addHint(makeHint(
+            HintCategory::VolatileInLoop, Impact::Medium, LoopDepth,
+            DRE->getBeginLoc(), Ctx,
+            "Volatile access inside loop (depth " +
+                std::to_string(LoopDepth) +
+                "); prevents optimization and vectorization",
+            "If volatile is not required for hardware/signal correctness, "
+            "remove it. If needed, consider reading into a local variable "
+            "once outside the loop"));
+      }
+    }
+    for (const Stmt *Child : S->children())
+      Walk(Child);
+  };
+  Walk(LoopBody);
+}
+
+// ---------------------------------------------------------------------------
+// 34. ImplicitConversion (narrowing)
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkImplicitConversion(const ImplicitCastExpr *ICE,
+                                            ASTContext &Ctx,
+                                            PerfHintCollector &Collector,
+                                            unsigned LoopDepth) {
+  if (!ICE || LoopDepth == 0)
+    return;
+
+  if (ICE->getCastKind() != CK_FloatingCast &&
+      ICE->getCastKind() != CK_IntegralCast)
+    return;
+
+  QualType SrcTy = ICE->getSubExpr()->getType();
+  QualType DstTy = ICE->getType();
+
+  uint64_t SrcSize = Ctx.getTypeSize(SrcTy);
+  uint64_t DstSize = Ctx.getTypeSize(DstTy);
+
+  // Only flag narrowing: larger source to smaller dest.
+  if (SrcSize <= DstSize)
+    return;
+
+  std::string SrcName = SrcTy.getAsString();
+  std::string DstName = DstTy.getAsString();
+
+  Collector.addHint(makeHint(
+      HintCategory::ImplicitConversion, Impact::Low, LoopDepth,
+      ICE->getBeginLoc(), Ctx,
+      "Implicit narrowing conversion from '" + SrcName + "' to '" + DstName +
+          "' inside loop (depth " + std::to_string(LoopDepth) +
+          "); may lose data and adds conversion overhead",
+      "Use an explicit cast to document intent, or change the "
+      "variable type to avoid the conversion"));
+}
+
+// ---------------------------------------------------------------------------
+// 35. SlicingCopy
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkSlicingCopy(const CallExpr *CE, ASTContext &Ctx,
+                                     PerfHintCollector &Collector,
+                                     unsigned LoopDepth) {
+  if (!CE)
+    return;
+
+  const FunctionDecl *Callee = CE->getDirectCallee();
+  if (!Callee)
+    return;
+
+  for (unsigned I = 0; I < CE->getNumArgs() && I < Callee->getNumParams();
+       ++I) {
+    const ParmVarDecl *Param = Callee->getParamDecl(I);
+    QualType ParamTy = Param->getType();
+
+    // Only check pass-by-value of class types.
+    if (ParamTy->isReferenceType() || ParamTy->isPointerType())
+      continue;
+    const CXXRecordDecl *ParamRD = ParamTy->getAsCXXRecordDecl();
+    if (!ParamRD || !ParamRD->hasDefinition())
+      continue;
+
+    // Check if the argument type is a derived class.
+    const Expr *Arg = CE->getArg(I)->IgnoreImpCasts();
+    QualType ArgTy = Arg->getType();
+    if (ArgTy->isReferenceType())
+      ArgTy = ArgTy.getNonReferenceType();
+    if (ArgTy->isPointerType())
+      continue;
+
+    const CXXRecordDecl *ArgRD = ArgTy->getAsCXXRecordDecl();
+    if (!ArgRD || !ArgRD->hasDefinition())
+      continue;
+
+    // Check if ArgRD derives from ParamRD (and they are different).
+    if (ArgRD == ParamRD)
+      continue;
+    if (!ArgRD->isDerivedFrom(ParamRD))
+      continue;
+
+    Collector.addHint(makeHint(
+        HintCategory::SlicingCopy, Impact::Medium, LoopDepth,
+        Arg->getBeginLoc(), Ctx,
+        "Passing derived class '" + ArgRD->getNameAsString() +
+            "' by value to parameter taking base class '" +
+            ParamRD->getNameAsString() +
+            "' — object slicing will discard derived-class data",
+        "Pass by reference or pointer to preserve the full object: "
+        "'const " +
+            ParamRD->getNameAsString() + "&'"));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 36. DivisionChain
+// ---------------------------------------------------------------------------
+
+void perfsanitizer::checkDivisionChain(const BinaryOperator *BO,
+                                       ASTContext &Ctx,
+                                       PerfHintCollector &Collector,
+                                       unsigned LoopDepth) {
+  if (!BO || BO->getOpcode() != BO_Div)
+    return;
+
+  // Only flag floating-point divisions (integer div has different semantics
+  // for reciprocal).
+  if (!BO->getType()->isFloatingType())
+    return;
+
+  const Expr *Divisor = BO->getRHS()->IgnoreParenImpCasts();
+
+  // Get the divisor as a DeclRefExpr.
+  const auto *DivRef = dyn_cast<DeclRefExpr>(Divisor);
+  if (!DivRef)
+    return;
+
+  const VarDecl *DivVar = dyn_cast<VarDecl>(DivRef->getDecl());
+  if (!DivVar)
+    return;
+
+  // Walk up to the enclosing compound statement via parent map to find
+  // sibling divisions by the same variable.
+  auto Parents = Ctx.getParents(*BO);
+  const CompoundStmt *Enclosing = nullptr;
+  for (int Depth = 0; Depth < 10 && !Parents.empty(); ++Depth) {
+    if (const auto *CS = Parents[0].get<CompoundStmt>()) {
+      Enclosing = CS;
+      break;
+    }
+    Parents = Ctx.getParents(Parents[0]);
+  }
+  if (!Enclosing)
+    return;
+
+  // Count divisions by the same variable in this compound.
+  unsigned DivCount = 0;
+  std::function<void(const Stmt *)> CountDivs = [&](const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *InnerBO = dyn_cast<BinaryOperator>(S)) {
+      if (InnerBO->getOpcode() == BO_Div &&
+          InnerBO->getType()->isFloatingType()) {
+        if (const auto *Ref =
+                dyn_cast<DeclRefExpr>(InnerBO->getRHS()->IgnoreParenImpCasts())) {
+          if (Ref->getDecl() == DivVar)
+            ++DivCount;
+        }
+      }
+    }
+    for (const Stmt *Child : S->children())
+      CountDivs(Child);
+  };
+  CountDivs(Enclosing);
+
+  if (DivCount < 2)
+    return;
+
+  // Only emit once per variable per compound — check if this is the first
+  // division in source order.
+  bool IsFirst = false;
+  std::function<bool(const Stmt *)> FindFirst = [&](const Stmt *S) -> bool {
+    if (!S)
+      return false;
+    if (S == BO) {
+      IsFirst = true;
+      return true;
+    }
+    if (const auto *InnerBO = dyn_cast<BinaryOperator>(S)) {
+      if (InnerBO->getOpcode() == BO_Div &&
+          InnerBO->getType()->isFloatingType()) {
+        if (const auto *Ref =
+                dyn_cast<DeclRefExpr>(InnerBO->getRHS()->IgnoreParenImpCasts())) {
+          if (Ref->getDecl() == DivVar)
+            return true; // Found an earlier division by same var.
+        }
+      }
+    }
+    for (const Stmt *Child : S->children()) {
+      if (FindFirst(Child))
+        return true;
+    }
+    return false;
+  };
+  FindFirst(Enclosing);
+
+  if (!IsFirst)
+    return;
+
+  Collector.addHint(makeHint(
+      HintCategory::DivisionChain, Impact::Medium, LoopDepth,
+      BO->getOperatorLoc(), Ctx,
+      "Multiple divisions by '" + DivVar->getNameAsString() +
+          "' (" + std::to_string(DivCount) +
+          " times) in the same block; division is expensive",
+      "Compute the reciprocal once ('double inv_" +
+          DivVar->getNameAsString() + " = 1.0 / " +
+          DivVar->getNameAsString() +
+          ";') and multiply instead"));
 }

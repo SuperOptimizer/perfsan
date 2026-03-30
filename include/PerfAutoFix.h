@@ -115,6 +115,44 @@ private:
                                              clang::ASTContext &Ctx);
   std::vector<AutoFix> fixRedundantComputComment(const PerfHint &H,
                                                   clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixAliasBarrier(const PerfHint &H,
+                                        clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixHotColdSplit(const PerfHint &H,
+                                        clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixRedundantLoad(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixSROAEscape(const PerfHint &H,
+                                      clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixMoveSemantics(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixBranchlessSelect(const PerfHint &H,
+                                            clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixLoopUnswitching(const PerfHint &H,
+                                           clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixSIMDWidth(const PerfHint &H,
+                                     clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixFalseSharing(const PerfHint &H,
+                                        clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixConstexprIf(const PerfHint &H,
+                                       clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixOutputParam(const PerfHint &H,
+                                       clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixUnusedInclude(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixSmallFunctionInline(const PerfHint &H,
+                                               clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixSortAlgorithm(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixBitManip(const PerfHint &H,
+                                    clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixRedundantAtomic(const PerfHint &H,
+                                           clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixCacheLineSplit(const PerfHint &H,
+                                          clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixCrossTUInline(const PerfHint &H,
+                                         clang::ASTContext &Ctx);
+  std::vector<AutoFix> fixHotColdFunc(const PerfHint &H,
+                                       clang::ASTContext &Ctx);
 };
 
 } // namespace perfsanitizer

@@ -56,6 +56,15 @@ private:
                             llvm::FunctionAnalysisManager &FAM);
   void checkHotColdFunction(llvm::Function &F,
                             llvm::FunctionAnalysisManager &FAM);
+  void checkSpillPressure(llvm::Function &F);
+  void checkUnrollingBlockers(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &FAM);
+  void checkDivisionChainIR(llvm::Function &F,
+                            llvm::FunctionAnalysisManager &FAM);
+  void checkBranchOnFloat(llvm::Function &F,
+                          llvm::FunctionAnalysisManager &FAM);
+  void checkMemoryAccessPattern(llvm::Function &F,
+                                llvm::FunctionAnalysisManager &FAM);
 };
 
 } // namespace perfsanitizer

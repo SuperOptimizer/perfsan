@@ -86,6 +86,11 @@ void PerfIRPass::analyzeFunction(Function &F, FunctionAnalysisManager &FAM) {
   checkCacheLineSplits(F, FAM);
   checkCrossTUInlining(F, FAM);
   checkHotColdFunction(F, FAM);
+  checkSpillPressure(F);
+  checkUnrollingBlockers(F, FAM);
+  checkDivisionChainIR(F, FAM);
+  checkBranchOnFloat(F, FAM);
+  checkMemoryAccessPattern(F, FAM);
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,5 +1178,223 @@ void PerfIRPass::checkHotColdFunction(Function &F,
         "be optimized for size instead of speed and placed in a cold "
         "section to improve instruction cache utilization.",
         F.getName()));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Spill pressure — excessive alloca-based loads/stores
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkSpillPressure(Function &F) {
+  // Collect allocas that are not simple single-use SROA candidates (i.e.,
+  // they have more than a handful of load/store users, suggesting the
+  // backend will need to spill them to the stack).
+  unsigned AllocaLoadStoreCount = 0;
+  Instruction *FirstAlloca = nullptr;
+
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      auto *AI = dyn_cast<AllocaInst>(&I);
+      if (!AI)
+        continue;
+
+      if (!FirstAlloca)
+        FirstAlloca = AI;
+
+      // Count loads and stores that directly use this alloca.
+      for (User *U : AI->users()) {
+        if (isa<LoadInst>(U) || isa<StoreInst>(U))
+          ++AllocaLoadStoreCount;
+      }
+    }
+  }
+
+  if (AllocaLoadStoreCount > 20 && FirstAlloca) {
+    unsigned Score = static_cast<unsigned>(Impact::Medium);
+    Collector.addHint(makeIRHint(
+        HintCategory::SROAEscape, Score, FirstAlloca,
+        "Function has " + std::to_string(AllocaLoadStoreCount) +
+            " loads/stores to stack allocations — potential register "
+            "pressure issue causing excessive spills/reloads.",
+        "Reduce the number of live local variables, break the function "
+        "into smaller pieces, or mark infrequently-used variables as "
+        "'volatile' to hint they can stay in memory.",
+        F.getName()));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Unrolling blockers — unknown trip count + function calls in loop
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkUnrollingBlockers(Function &F,
+                                        FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+  auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    unsigned Depth = L->getLoopDepth();
+
+    // Check if trip count is unknown.
+    const SCEV *BackedgeTakenCount = SE.getBackedgeTakenCount(L);
+    if (!isa<SCEVCouldNotCompute>(BackedgeTakenCount))
+      continue;
+
+    // Check for non-intrinsic function calls in the loop.
+    bool HasFunctionCall = false;
+    Instruction *CallSite = nullptr;
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          Function *Callee = CI->getCalledFunction();
+          if (!Callee || !Callee->isIntrinsic()) {
+            HasFunctionCall = true;
+            CallSite = &I;
+            break;
+          }
+        }
+      }
+      if (HasFunctionCall)
+        break;
+    }
+
+    if (!HasFunctionCall)
+      continue;
+
+    unsigned Score = scaleByLoopDepth(Impact::High, Depth);
+    Collector.addHint(makeIRHint(
+        HintCategory::LoopBound, Score, CallSite,
+        "Loop has unknown trip count and contains function calls — "
+        "cannot be unrolled by the compiler.",
+        "Provide a compile-time upper bound for the trip count with "
+        "__builtin_assume(n <= MAX), or move function calls outside "
+        "the loop to enable partial unrolling.",
+        F.getName()));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Division chain — repeated sdiv/udiv with same divisor in loop
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkDivisionChainIR(Function &F,
+                                      FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    unsigned Depth = L->getLoopDepth();
+
+    for (BasicBlock *BB : L->blocks()) {
+      // Map divisor Value* to the list of div instructions using it.
+      DenseMap<Value *, SmallVector<Instruction *, 4>> DivisorMap;
+
+      for (Instruction &I : *BB) {
+        unsigned Opcode = I.getOpcode();
+        if (Opcode != Instruction::SDiv && Opcode != Instruction::UDiv)
+          continue;
+
+        Value *Divisor = I.getOperand(1);
+        DivisorMap[Divisor].push_back(&I);
+      }
+
+      for (auto &[Divisor, Divs] : DivisorMap) {
+        if (Divs.size() < 2)
+          continue;
+
+        unsigned Score = scaleByLoopDepth(Impact::Medium, Depth);
+        Collector.addHint(makeIRHint(
+            HintCategory::StrengthReduction, Score, Divs.front(),
+            "Multiple division instructions (" +
+                std::to_string(Divs.size()) +
+                ") with the same divisor in a loop basic block — "
+                "redundant expensive operations.",
+            "Precompute the reciprocal of the divisor once before the "
+            "loop and multiply instead of dividing, or refactor to "
+            "share the division result.",
+            F.getName()));
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Branch on float — fcmp + br patterns inside loops
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkBranchOnFloat(Function &F,
+                                    FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+
+  for (BasicBlock &BB : F) {
+    unsigned LoopDepth = LI.getLoopDepth(&BB);
+    if (LoopDepth == 0)
+      continue;
+
+    auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
+    if (!BI || !BI->isConditional())
+      continue;
+
+    // Check if the branch condition is an fcmp.
+    if (auto *FC = dyn_cast<FCmpInst>(BI->getCondition())) {
+      unsigned Score = scaleByLoopDepth(Impact::Low, LoopDepth);
+      Collector.addHint(makeIRHint(
+          HintCategory::BranchPrediction, Score, FC,
+          "Branch conditioned on floating-point comparison inside loop — "
+          "FP comparisons have higher latency than integer comparisons "
+          "and may cause pipeline stalls.",
+          "If possible, convert the comparison to integer arithmetic "
+          "(e.g., compare bit representations or use integer thresholds), "
+          "or restructure to use branchless select (ternary operator).",
+          F.getName()));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Memory access pattern — non-sequential GEP strides in loops
+// ---------------------------------------------------------------------------
+
+void PerfIRPass::checkMemoryAccessPattern(Function &F,
+                                          FunctionAnalysisManager &FAM) {
+  auto &LI = FAM.getResult<LoopAnalysis>(F);
+  auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    unsigned Depth = L->getLoopDepth();
+
+    for (BasicBlock *BB : L->blocks()) {
+      for (Instruction &I : *BB) {
+        auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+        if (!GEP)
+          continue;
+
+        // Check each index for a non-unit stride AddRec.
+        for (auto Idx = GEP->idx_begin(); Idx != GEP->idx_end(); ++Idx) {
+          const SCEV *IdxSCEV = SE.getSCEV(Idx->get());
+          auto *AR = dyn_cast<SCEVAddRecExpr>(IdxSCEV);
+          if (!AR || AR->getLoop() != L)
+            continue;
+
+          // Check if the step is a constant greater than 1.
+          if (auto *StepConst = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))) {
+            int64_t Step = StepConst->getAPInt().getSExtValue();
+            if (Step > 1 || Step < -1) {
+              unsigned Score = scaleByLoopDepth(Impact::Medium, Depth);
+              Collector.addHint(makeIRHint(
+                  HintCategory::Vectorization, Score, &I,
+                  "GEP index has stride " + std::to_string(Step) +
+                      " per iteration — non-sequential memory access "
+                      "pattern hurts hardware prefetching and cache "
+                      "utilization.",
+                  "Restructure data layout or loop order for unit-stride "
+                  "(sequential) access. Consider tiling/blocking the loop "
+                  "or transposing the data structure.",
+                  F.getName()));
+              break; // One hint per GEP.
+            }
+          }
+        }
+      }
+    }
   }
 }

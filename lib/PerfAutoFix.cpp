@@ -16,6 +16,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <string>
 
 using namespace clang;
@@ -126,7 +127,7 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
   case HintCategory::ColdPathOutlining:
     return fixColdPath(Hint, Ctx);
   case HintCategory::ContainerReserve:
-    return {}; // Disabled: scope analysis too fragile for safe auto-fix
+    return fixContainerReserve(Hint, Ctx);
   case HintCategory::StringByValue:
     return fixStringByValue(Hint, Ctx);
   case HintCategory::RangeForConversion:
@@ -163,6 +164,44 @@ std::vector<AutoFix> PerfAutoFixer::generateFixes(const PerfHint &Hint,
     return fixTightAllocComment(Hint, Ctx);
   case HintCategory::RedundantComputation:
     return fixRedundantComputComment(Hint, Ctx);
+  case HintCategory::AliasBarrier:
+    return fixAliasBarrier(Hint, Ctx);
+  case HintCategory::HotColdSplit:
+    return fixHotColdSplit(Hint, Ctx);
+  case HintCategory::RedundantLoad:
+    return fixRedundantLoad(Hint, Ctx);
+  case HintCategory::SROAEscape:
+    return fixSROAEscape(Hint, Ctx);
+  case HintCategory::MoveSemantics:
+    return fixMoveSemantics(Hint, Ctx);
+  case HintCategory::BranchlessSelect:
+    return fixBranchlessSelect(Hint, Ctx);
+  case HintCategory::LoopUnswitching:
+    return fixLoopUnswitching(Hint, Ctx);
+  case HintCategory::SIMDWidth:
+    return fixSIMDWidth(Hint, Ctx);
+  case HintCategory::FalseSharing:
+    return fixFalseSharing(Hint, Ctx);
+  case HintCategory::ConstexprIf:
+    return fixConstexprIf(Hint, Ctx);
+  case HintCategory::OutputParamToReturn:
+    return fixOutputParam(Hint, Ctx);
+  case HintCategory::UnusedInclude:
+    return fixUnusedInclude(Hint, Ctx);
+  case HintCategory::SmallFunctionNotInline:
+    return fixSmallFunctionInline(Hint, Ctx);
+  case HintCategory::SortAlgorithm:
+    return fixSortAlgorithm(Hint, Ctx);
+  case HintCategory::BitManipulation:
+    return fixBitManip(Hint, Ctx);
+  case HintCategory::RedundantAtomic:
+    return fixRedundantAtomic(Hint, Ctx);
+  case HintCategory::CacheLineSplit:
+    return fixCacheLineSplit(Hint, Ctx);
+  case HintCategory::CrossTUInlining:
+    return fixCrossTUInline(Hint, Ctx);
+  case HintCategory::HotColdFunction:
+    return fixHotColdFunc(Hint, Ctx);
   default:
     return {};
   }
@@ -1259,31 +1298,12 @@ PerfAutoFixer::fixContainerReserve(const PerfHint &H, ASTContext &Ctx) {
   if (Bound.empty())
     return {};
 
-  // Only use simple identifiers or integer literals as the bound.
-  // Reject function calls, complex expressions, etc.
-  bool SimpleBound = true;
-  for (char C : Bound) {
-    if (!isalnum(C) && C != '_') {
-      SimpleBound = false;
-      break;
-    }
-  }
-  if (!SimpleBound)
+  // Safety: only allow pure integer literals as the bound.
+  // Reject variable names, function calls, complex expressions, etc.
+  if (Bound.empty())
     return {};
-
-  // Scope check: only allow integer literals or local variables visible before
-  // the loop. Integer literals start with a digit. For variable names, verify
-  // the identifier appears in the source text before the for loop.
-  if (!Bound.empty() && !std::isdigit(Bound[0])) {
-    // It's a variable name — check it appears before the for loop in the
-    // surrounding context. Read up to 1024 chars before the loop.
-    unsigned FileOffset = SM.getFileOffset(Loc);
-    unsigned ScanBack = std::min(FileOffset, 1024u);
-    SourceLocation ContextStart = Loc.getLocWithOffset(-(int)ScanBack);
-    StringRef PreContext = getSourceSnippet(ContextStart, ScanBack, SM, LO);
-    if (PreContext.empty() || !PreContext.contains(Bound))
-      return {};
-  }
+  if (!std::all_of(Bound.begin(), Bound.end(), ::isdigit))
+    return {};
 
   // Find push_back in the loop body to identify the container.
   size_t PushPos = Snippet.find("push_back");
@@ -2141,6 +2161,540 @@ PerfAutoFixer::fixRedundantComputComment(const PerfHint &H, ASTContext &Ctx) {
   Fix.FixKind = AutoFix::Insert;
   Fix.NewText = Indent + "// PERF: hoist invariant computation outside loop\n";
   Fix.Description = "suggest hoisting invariant computation outside loop";
+  return {Fix};
+}
+
+//===----------------------------------------------------------------------===//
+// New auto-fix generators (batch 3) — previously unhandled categories
+//===----------------------------------------------------------------------===//
+
+std::vector<AutoFix>
+PerfAutoFixer::fixAliasBarrier(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("__restrict__") ||
+      Snippet.contains("assume_safety") ||
+      Snippet.contains("PERF: add __restrict__"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: add __restrict__ or #pragma clang loop "
+                "vectorize(assume_safety)\n";
+  Fix.Description = "suggest alias barrier to enable vectorization";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixHotColdSplit(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Safety: skip if already has __attribute__((cold)).
+  if (Snippet.contains("__attribute__((cold))"))
+    return {};
+
+  // Verify this looks like a function declaration.
+  if (!Snippet.contains("("))
+    return {};
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = "__attribute__((cold)) ";
+  Fix.Description = "add __attribute__((cold)) for hot/cold splitting";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixRedundantLoad(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: hoist repeated load"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: hoist repeated load to a local variable\n";
+  Fix.Description = "suggest hoisting repeated load to a local variable";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixSROAEscape(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: pass struct fields individually"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: pass struct fields individually instead of "
+                "pointer\n";
+  Fix.Description = "suggest passing struct fields individually to enable SROA";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixMoveSemantics(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Find "return expr;" pattern.
+  SourceLocation RetLoc = findTextAfter(Loc, "return ", 512, SM, LO);
+  if (RetLoc.isInvalid())
+    return {};
+
+  StringRef FromRet = getSourceSnippet(RetLoc, 256, SM, LO);
+  if (FromRet.empty())
+    return {};
+
+  // Already uses std::move?
+  if (FromRet.contains("std::move"))
+    return {};
+
+  // Extract the expression after "return ".
+  StringRef AfterReturn = FromRet.substr(7).ltrim(); // skip "return "
+  size_t SemiPos = AfterReturn.find(';');
+  if (SemiPos == StringRef::npos)
+    return {};
+
+  StringRef Expr = AfterReturn.substr(0, SemiPos).trim();
+  if (Expr.empty())
+    return {};
+
+  // Safety: only when expr is a simple identifier (local variable name).
+  // Must be alphanumeric/underscore only — not a function call, not a complex
+  // expression.
+  for (char C : Expr) {
+    if (!isalnum(C) && C != '_')
+      return {};
+  }
+
+  // Don't transform if the expression starts with a digit (it's a literal).
+  if (!Expr.empty() && std::isdigit(Expr[0]))
+    return {};
+
+  std::string OldText = ("return " + Expr + ";").str();
+  std::string NewText = ("return std::move(" + Expr + ");").str();
+
+  AutoFix Fix;
+  Fix.Loc = RetLoc;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = OldText;
+  Fix.NewText = NewText;
+  Fix.Description = "use std::move to enable move semantics on return";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixBranchlessSelect(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: use ternary"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: use ternary (cond ? a : b) for branchless "
+                "select\n";
+  Fix.Description = "suggest ternary operator for branchless select";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixLoopUnswitching(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: hoist loop-invariant condition"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: hoist loop-invariant condition outside the "
+                "loop\n";
+  Fix.Description = "suggest hoisting loop-invariant condition outside loop";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixSIMDWidth(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 512, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("vectorize(enable)") ||
+      Snippet.contains("vectorize(assume_safety)"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "#pragma clang loop vectorize(enable)\n";
+  Fix.Description = "add vectorization pragma to widen SIMD width";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixFalseSharing(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: add alignas(64) padding") ||
+      Snippet.contains("alignas(64)"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: add alignas(64) padding between atomic "
+                "fields to prevent false sharing\n";
+  Fix.Description =
+      "suggest alignas(64) padding to prevent false sharing";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixConstexprIf(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Already constexpr if?
+  if (Snippet.contains("if constexpr"))
+    return {};
+
+  // Find "if (sizeof" or "if (std::is_" pattern.
+  SourceLocation IfSizeof = findTextAfter(Loc, "if (sizeof", 256, SM, LO);
+  SourceLocation IfIsType = findTextAfter(Loc, "if (std::is_", 256, SM, LO);
+
+  SourceLocation Target;
+  if (IfSizeof.isValid())
+    Target = IfSizeof;
+  else if (IfIsType.isValid())
+    Target = IfIsType;
+  else
+    return {};
+
+  AutoFix Fix;
+  Fix.Loc = Target;
+  Fix.FixKind = AutoFix::Replace;
+  Fix.OldText = "if (";
+  Fix.NewText = "if constexpr (";
+  Fix.Description = "use if constexpr for compile-time constant condition";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixOutputParam(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: return by value"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: return by value instead of output "
+                "parameter\n";
+  Fix.Description = "suggest returning by value instead of output parameter";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixUnusedInclude(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: consider forward declaration"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: consider forward declaration instead of "
+                "full include\n";
+  Fix.Description = "suggest forward declaration instead of full include";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixSmallFunctionInline(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Safety: skip if already inline or __forceinline.
+  if (Snippet.ltrim().starts_with("inline") ||
+      Snippet.contains("__forceinline") ||
+      Snippet.contains("always_inline"))
+    return {};
+
+  // Verify this looks like a function declaration.
+  if (!Snippet.contains("("))
+    return {};
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = "inline ";
+  Fix.Description = "add inline hint for small function";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixSortAlgorithm(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: use std::sort()"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: use std::sort() instead of manual sort "
+                "implementation\n";
+  Fix.Description = "suggest std::sort() instead of manual sort";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixBitManip(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: use __builtin_popcount"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: use __builtin_popcount/__builtin_ctz "
+                "instead of manual bit counting\n";
+  Fix.Description = "suggest compiler builtins for bit manipulation";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixRedundantAtomic(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: batch sequential atomic"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: batch sequential atomic operations or use "
+                "relaxed ordering\n";
+  Fix.Description = "suggest batching sequential atomic operations";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixCacheLineSplit(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: add padding (alignas(64))") ||
+      Snippet.contains("alignas(64)"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: add padding (alignas(64)) to prevent cache "
+                "line splitting\n";
+  Fix.Description = "suggest alignas(64) to prevent cache line splitting";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixCrossTUInline(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  if (Snippet.contains("PERF: move function definition to header"))
+    return {};
+
+  unsigned Col = SM.getSpellingColumnNumber(Loc);
+  std::string Indent(Col > 1 ? Col - 1 : 0, ' ');
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Indent + "// PERF: move function definition to header or "
+                "enable LTO for cross-TU inlining\n";
+  Fix.Description = "suggest header definition or LTO for cross-TU inlining";
+  return {Fix};
+}
+
+std::vector<AutoFix>
+PerfAutoFixer::fixHotColdFunc(const PerfHint &H, ASTContext &Ctx) {
+  const LangOptions &LO = Ctx.getLangOpts();
+  SourceLocation Loc = H.SrcLoc;
+
+  StringRef Snippet = getSourceSnippet(Loc, 256, SM, LO);
+  if (Snippet.empty())
+    return {};
+
+  // Already annotated?
+  if (Snippet.contains("__attribute__((hot))") ||
+      Snippet.contains("__attribute__((cold))"))
+    return {};
+
+  // Verify this looks like a function declaration.
+  if (!Snippet.contains("("))
+    return {};
+
+  // Determine hot vs cold from the hint message.
+  bool IsCold = H.Message.find("cold") != std::string::npos;
+  bool IsHot = H.Message.find("hot") != std::string::npos;
+
+  std::string Attr;
+  std::string Desc;
+  if (IsCold && !IsHot) {
+    Attr = "__attribute__((cold)) ";
+    Desc = "add __attribute__((cold)) to mark cold function";
+  } else if (IsHot && !IsCold) {
+    Attr = "__attribute__((hot)) ";
+    Desc = "add __attribute__((hot)) to mark hot function";
+  } else if (IsHot && IsCold) {
+    // Ambiguous — prefer hot since hint message mentions both
+    Attr = "__attribute__((hot)) ";
+    Desc = "add __attribute__((hot)) to mark hot function";
+  } else {
+    // Neither keyword found — default to hot
+    Attr = "__attribute__((hot)) ";
+    Desc = "add __attribute__((hot)) to mark frequently called function";
+  }
+
+  AutoFix Fix;
+  Fix.Loc = Loc;
+  Fix.FixKind = AutoFix::Insert;
+  Fix.NewText = Attr;
+  Fix.Description = Desc;
   return {Fix};
 }
 

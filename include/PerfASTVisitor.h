@@ -37,8 +37,10 @@ public:
   bool VisitCXXNewExpr(clang::CXXNewExpr *NE);
   bool VisitCXXThrowExpr(clang::CXXThrowExpr *TE);
   bool VisitBinaryOperator(clang::BinaryOperator *BO);
+  bool VisitUnaryOperator(clang::UnaryOperator *UO);
   bool VisitDeclRefExpr(clang::DeclRefExpr *DRE);
   bool VisitCXXTryStmt(clang::CXXTryStmt *S);
+  bool VisitCXXForRangeStmt(clang::CXXForRangeStmt *S);
   bool VisitLambdaExpr(clang::LambdaExpr *LE);
 
 private:
